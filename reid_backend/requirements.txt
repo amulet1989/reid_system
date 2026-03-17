@@ -1,0 +1,22 @@
+# Modelos y Machine Learning
+numpy<2.0.0
+transformers>=4.38.0
+accelerate
+kornia
+git+https://github.com/cvg/LightGlue.git
+
+# Visión Computacional
+opencv-python-headless
+Pillow
+
+# Base de Datos Vectorial
+qdrant-client
+
+# Utilidades y Procesamiento
+pandas
+tqdm
+pyyaml
+
+# Sistema de Colas (Worker)
+celery
+redis

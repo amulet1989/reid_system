@@ -1,0 +1,83 @@
+# reid_system/docker-compose.yml
+services:
+  # 1. Base de Datos Vectorial
+  vector_db:
+    image: qdrant/qdrant:latest
+    container_name: reid_qdrant
+    networks:
+      - retail_net
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./data/qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+  # 2. Cola de Mensajes
+  redis:
+    image: redis:alpine
+    container_name: reid_redis
+    networks:
+      - retail_net
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # 3. API Gateway (FastAPI)
+  api:
+    build: 
+      context: ./api
+    container_name: reid_api
+    networks:
+      - retail_net
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+    depends_on:
+      - redis
+      - vector_db
+    restart: unless-stopped
+
+  # 4. El Cerebro SOTA (Celery Worker con GPU)
+  reid_backend:
+    build:
+      context: ./reid_backend
+    container_name: reid_worker
+    networks:
+      - retail_net
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./config.yml:/app/config.yml:ro
+    depends_on:
+      - redis
+      - vector_db
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # 5. Interfaz de Usuario Visual
+  web_ui:
+    build:
+      context: ./web_ui
+    container_name: reid_web
+    networks:
+      - retail_net
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    restart: unless-stopped
+    
+networks:
+  retail_net:
+    driver: bridge

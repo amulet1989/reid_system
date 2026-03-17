@@ -1,0 +1,35 @@
+# reid_system/config.yml
+
+system:
+  device: "cuda"
+  # Las rutas apuntan a /app/data porque así montaremos el volumen en Docker
+  cache_dir: "/app/data/features_cache"
+  catalog_dir: "/app/data/Catalogo"
+  csv_path: "/app/data/Catalogo.csv"
+
+database:
+  collection_name: "products_sota_pipeline"
+
+models:
+  dinov2:
+    repo: "facebookresearch/dinov2"
+    name: "dinov2_vitb14"
+    image_size: 518
+    vector_size: 768
+  qwen:
+    id: "Qwen/Qwen3-VL-Embedding-2B"
+    max_image_size: 1024
+    vector_size: 2048
+  aliked:
+    model_name: "aliked-n16rot"
+    max_num_keypoints: 4096
+    detection_threshold: 0.2
+    max_image_size: 1024
+
+pipeline:
+  retrieval:
+    top_k: 40
+  verification:
+    min_matches_lightglue: 10
+    ransac_threshold: 4.0
+    min_inliers_valid: 10

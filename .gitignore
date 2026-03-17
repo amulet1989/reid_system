@@ -1,0 +1,52 @@
+# =========================
+# Entornos y Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.venv/
+env/
+miniconda3/
+
+# =========================
+# Secretos y Configuración
+# =========================
+.env
+# Nota: config.yml SÍ se sube a Git porque define la arquitectura. 
+# El .env NO se sube porque simula tener credenciales.
+
+# =========================
+# Datos de Aplicación y DB (¡Muy Pesado!)
+# =========================
+data/features_cache/
+data/qdrant_storage/
+data/Catalogo/
+*.csv
+
+# =========================
+# Pesos de Modelos (PyTorch / HuggingFace)
+# =========================
+*.pt
+*.pth
+*.bin
+*.safetensors
+.huggingface/
+.cache/
+
+# =========================
+# OS y Editores de Código
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# =========================
+# Logs de Celery / FastAPI
+# =========================
+*.log
+celerybeat-schedule
+celerybeat.pid
