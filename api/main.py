@@ -1,4 +1,5 @@
 import os
+from fastapi.responses import FileResponse
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -81,3 +82,19 @@ async def sync_catalog():
     """
     task = celery_client.send_task("tasks.sync_catalog")
     return {"message": "Trabajo de sincronización de catálogo encolado", "task_id": task.id}
+
+@app.get("/api/v1/image", summary="Obtener imagen de referencia")
+async def get_reference_image(path: str):
+    """
+    Sirve la imagen estática de referencia desde el catálogo para la interfaz web.
+    """
+    # 1. Seguridad: Solo permitimos leer dentro de la carpeta del catálogo
+    if not path.startswith("/app/data/Catalogo"):
+        raise HTTPException(status_code=403, detail="Acceso denegado. Ruta no permitida.")
+    
+    # 2. Verificamos que el archivo exista
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="La imagen no fue encontrada en el servidor.")
+        
+    # 3. Devolvemos la imagen
+    return FileResponse(path)

@@ -162,6 +162,24 @@ with col2:
                     for det in detections:
                         st.markdown(f"### BBox {det['bbox_index'] + 1}: `{det['bbox_coords']}`")
                         st.json(det["prediction"])
+                        
+                        # Si hay un path de imagen, creamos un acordeón (expander)
+                        img_path = det["prediction"].get("image_path")
+                        if img_path:
+                            with st.expander("🖼️ Ver imagen de referencia"):
+                                with st.spinner("Cargando miniatura..."):
+                                    try:
+                                        # Llamamos al nuevo endpoint de la API
+                                        res_img = requests.get(f"{API_URL}/image", params={"path": img_path})
+                                        
+                                        if res_img.status_code == 200:
+                                            # Convertimos los bytes descargados a una imagen de Pillow
+                                            ref_image = Image.open(io.BytesIO(res_img.content))
+                                            st.image(ref_image, caption="Referencia oficial", use_column_width=True)
+                                        else:
+                                            st.error(f"Error {res_img.status_code}: Imagen no encontrada en la base de datos.")
+                                    except Exception as e:
+                                        st.error(f"No se pudo conectar a la API de imágenes: {e}")
                     break
                 elif estado == "FAILED":
                     status_placeholder.error(f"❌ Error: {res.get('error')}")
