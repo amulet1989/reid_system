@@ -4,7 +4,7 @@ import torch
 import cv2
 import numpy as np
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageOps
 from tqdm import tqdm
 import torchvision.transforms as T
 from transformers import AutoProcessor, AutoModel
@@ -100,6 +100,10 @@ def get_dinov2_embedding_from_array(img_rgb):
 
 def get_qwen_layout_embedding_from_array(img_rgb, metadata_text=""):
     image = Image.fromarray(img_rgb)
+    
+    # --- PARCHE DE ROTACIÓN EXIF ---
+    image = ImageOps.exif_transpose(image) # ¡VITAL! Corregir orientación cruda
+
     max_size = cfg['models']['qwen']['max_image_size']
     if max(image.size) > max_size:
         image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
@@ -132,10 +136,20 @@ def extract_aliked_features_from_array(img_rgb):
 
 # --- 4. FUNCIONES DE INGESTA (OFFLINE) ---
 def index_product_offline(sku, name, category, image_path, view_name="frente"):
-    img_bgr = cv2.imread(image_path)
-    if img_bgr is None:
-        raise ValueError(f"No se pudo leer la imagen: {image_path}")
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    
+    # img_bgr = cv2.imread(image_path)
+    # if img_bgr is None:
+    #     raise ValueError(f"No se pudo leer la imagen: {image_path}")
+    # img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    try:
+        pil_img = Image.open(image_path).convert("RGB")
+        # --- PARCHE DE ROTACIÓN EXIF ---
+        pil_img = ImageOps.exif_transpose(pil_img) # Hornear rotación física
+        # -------------------------------
+        img_rgb = np.array(pil_img)
+    except Exception as e:
+        raise ValueError(f"No se pudo leer la imagen con Pillow: {image_path}. Error: {e}")
 
     vec_visual = get_dinov2_embedding_from_array(img_rgb)
     context = f"Product: {name}. Category: {category}. Packaging view: {view_name}."

@@ -7,7 +7,7 @@ git+https://github.com/cvg/LightGlue.git
 
 # Visión Computacional
 opencv-python-headless
-Pillow
+Pillow>=10.0.0
 
 # Base de Datos Vectorial
 qdrant-client

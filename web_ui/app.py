@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import base64
 import time
-from PIL import Image
+from PIL import Image, ImageOps, ImageDraw
 import io
 from streamlit_drawable_canvas import st_canvas
 
@@ -58,6 +58,9 @@ with col1:
 
     if uploaded_file is not None:
         image = Image.open(uploaded_file).convert("RGB")
+        # --- PARCHE DE ROTACIÓN EXIF ---
+        image = ImageOps.exif_transpose(image) # ¡VITAL! Hornear rotación física
+        # -------------------------------
         img_width, img_height = image.size
         
         # Pestañas para elegir el método de ingreso de BBoxes
@@ -166,20 +169,36 @@ with col2:
                         # Si hay un path de imagen, creamos un acordeón (expander)
                         img_path = det["prediction"].get("image_path")
                         if img_path:
-                            with st.expander("🖼️ Ver imagen de referencia"):
-                                with st.spinner("Cargando miniatura..."):
+                            with st.expander("🔬 Ver Validación Visual del Match"):
+                                with st.spinner("Generando visualización..."):
                                     try:
-                                        # Llamamos al nuevo endpoint de la API
                                         res_img = requests.get(f"{API_URL}/image", params={"path": img_path})
                                         
                                         if res_img.status_code == 200:
-                                            # Convertimos los bytes descargados a una imagen de Pillow
-                                            ref_image = Image.open(io.BytesIO(res_img.content))
-                                            st.image(ref_image, caption="Referencia oficial", use_column_width=True)
+                                            # 1. Cargar imagen de referencia del catálogo
+                                            ref_image_pil = Image.open(io.BytesIO(res_img.content))
+                                            
+                                            # 2. Dibujar el BBox sobre una copia de tu foto original
+                                            img_with_bbox = image.copy()
+                                            draw = ImageDraw.Draw(img_with_bbox)
+                                            x1, y1, x2, y2 = det['bbox_coords']
+                                            
+                                            # Dibujamos un rectángulo verde (grosor 5)
+                                            draw.rectangle([x1, y1, x2, y2], outline="#00FF00", width=5)
+
+                                            # 3. Mostrar lado a lado
+                                            st.markdown("**Izquierda:** Tu recorte exacto. **Derecha:** Referencia oficial.")
+                                            
+                                            col_c, col_r = st.columns(2)
+                                            with col_c:
+                                                st.image(img_with_bbox, caption="Ubicación en Estante", use_column_width=True)
+                                            with col_r:
+                                                st.image(ref_image_pil, caption="Referencia Catálogo", use_column_width=True)
+
                                         else:
-                                            st.error(f"Error {res_img.status_code}: Imagen no encontrada en la base de datos.")
+                                            st.error(f"Error {res_img.status_code}: Imagen no encontrada.")
                                     except Exception as e:
-                                        st.error(f"No se pudo conectar a la API de imágenes: {e}")
+                                        st.error(f"No se pudo generar la visualización: {e}")
                     break
                 elif estado == "FAILED":
                     status_placeholder.error(f"❌ Error: {res.get('error')}")
