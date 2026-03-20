@@ -169,8 +169,8 @@ with col2:
                         # Si hay un path de imagen, creamos un acordeón (expander)
                         img_path = det["prediction"].get("image_path")
                         if img_path:
-                            with st.expander("🔬 Ver Validación Visual del Match"):
-                                with st.spinner("Generando visualización..."):
+                            with st.expander("🔬 Ver Validación Visual del Recorte"):
+                                with st.spinner("Generando visualización del recorte..."):
                                     try:
                                         res_img = requests.get(f"{API_URL}/image", params={"path": img_path})
                                         
@@ -178,25 +178,21 @@ with col2:
                                             # 1. Cargar imagen de referencia del catálogo
                                             ref_image_pil = Image.open(io.BytesIO(res_img.content))
                                             
-                                            # 2. Dibujar el BBox sobre una copia de tu foto original
-                                            img_with_bbox = image.copy()
-                                            draw = ImageDraw.Draw(img_with_bbox)
+                                            # 2. Recortar (Crop) el producto exacto de la foto original usando Pillow
                                             x1, y1, x2, y2 = det['bbox_coords']
-                                            
-                                            # Dibujamos un rectángulo verde (grosor 5)
-                                            draw.rectangle([x1, y1, x2, y2], outline="#00FF00", width=5)
+                                            img_crop = image.crop((x1, y1, x2, y2))
 
                                             # 3. Mostrar lado a lado
                                             st.markdown("**Izquierda:** Tu recorte exacto. **Derecha:** Referencia oficial.")
                                             
                                             col_c, col_r = st.columns(2)
                                             with col_c:
-                                                st.image(img_with_bbox, caption="Ubicación en Estante", use_column_width=True)
+                                                st.image(img_crop, caption="Crop enviado a la IA", use_column_width=True)
                                             with col_r:
-                                                st.image(ref_image_pil, caption="Referencia Catálogo", use_column_width=True)
+                                                st.image(ref_image_pil, caption="Referencia del Catálogo", use_column_width=True)
 
                                         else:
-                                            st.error(f"Error {res_img.status_code}: Imagen no encontrada.")
+                                            st.error(f"Error {res_img.status_code}: Imagen de catálogo no encontrada.")
                                     except Exception as e:
                                         st.error(f"No se pudo generar la visualización: {e}")
                     break
