@@ -6,10 +6,12 @@ import numpy as np
 import pandas as pd
 from PIL import Image, ImageOps
 from tqdm import tqdm
+import gc
 import torchvision.transforms as T
 from transformers import AutoProcessor, AutoModel
-from lightglue import LightGlue, ALIKED
+from lightglue import LightGlue, ALIKED, SuperPoint
 from lightglue.utils import numpy_image_to_torch, rbd
+import kornia.feature as KF
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from qdrant_client import models
@@ -61,12 +63,28 @@ def init_system():
     qwen_model = AutoModel.from_pretrained(qwen_id, trust_remote_code=True).to(DEVICE)
     qwen_model.eval()
 
-    print("🧠 Cargando ALIKED y LightGlue...")
-    extractor = ALIKED(
-        max_num_keypoints=cfg['models']['aliked']['max_num_keypoints'], 
-        detection_threshold=cfg['models']['aliked']['detection_threshold']
-    ).eval().to(DEVICE)
-    matcher = LightGlue(features='aliked').eval().to(DEVICE)
+    # 4. Cargar Extractor Local y LightGlue -------------------------------------
+    feat_type = cfg['models']['local_features']['type'].lower()
+    print(f"🧠 Cargando Extractor Local ({feat_type.upper()}) y LightGlue...")
+    
+    max_kp = cfg['models']['local_features']['max_num_keypoints']
+    det_thresh = cfg['models']['local_features']['detection_threshold']
+
+    if feat_type == "dedode":
+        extractor = KF.DeDoDe.from_pretrained(detector_weights="L-upright", descriptor_weights="B-upright").eval().to(DEVICE)
+        matcher = KF.LightGlue("dedodeb").eval().to(DEVICE) # ✅ La versión nativa (Drop-in replacement)
+    elif feat_type == "aliked":
+        extractor = ALIKED(max_num_keypoints=max_kp, detection_threshold=det_thresh).eval().to(DEVICE)
+        matcher = LightGlue(features=feat_type).eval().to(DEVICE)
+    elif feat_type == "superpoint":
+        extractor = SuperPoint(max_num_keypoints=max_kp, nms_radius=4, keypoint_threshold=det_thresh).eval().to(DEVICE)
+        matcher = LightGlue(features=feat_type).eval().to(DEVICE)
+    elif feat_type in ["disk", "sift"]:
+        # Otros modelos soportados
+        matcher = LightGlue(features=feat_type).eval().to(DEVICE)
+    else:
+        raise ValueError(f"Extractor no soportado: {feat_type}")
+    # --------------------------------------------------------------------
 
     print("✅ Todos los modelos cargados en GPU exitosamente.")
 
@@ -112,36 +130,57 @@ def get_qwen_layout_embedding_from_array(img_rgb, metadata_text=""):
     messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": raw_prompt}]}]
     
     text_prompt = qwen_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = qwen_processor(images=image, text=text_prompt, return_tensors="pt", padding=True).to(DEVICE)
     
+    # Subimos el inference_mode para envolver todo el paso por la GPU
     with torch.inference_mode():
+        inputs = qwen_processor(images=image, text=text_prompt, return_tensors="pt", padding=True).to(DEVICE)
         outputs = qwen_model(**inputs)
         emb = outputs.last_hidden_state[:, -1, :] 
     
     emb = emb.float()
     return (emb / emb.norm(dim=-1, keepdim=True))[0].cpu().numpy()
 
-def extract_aliked_features_from_array(img_rgb):
+
+@torch.inference_mode()
+def extract_local_features_from_array(img_rgb):
     img = img_rgb.copy()
-    max_dim = cfg['models']['aliked']['max_image_size']
+    max_dim = cfg['models']['local_features']['max_image_size']
     h, w = img.shape[:2]
     if max(h, w) > max_dim:
         scale = max_dim / max(h, w)
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
         
-    image_tensor = numpy_image_to_torch(img).to(DEVICE)
-    with torch.inference_mode():
+    feat_type = cfg['models']['local_features']['type'].lower()
+    
+    if feat_type == "dedode":
+        image_tensor = T.ToTensor()(img).unsqueeze(0).to(DEVICE)
+    
+        max_kp = cfg['models']['local_features']['max_num_keypoints']
+        # ← CORRECCIÓN: usar named argument + forzar batch dim (KF.LightGlue lo exige)
+        keypoints, scores, descriptors = extractor(image_tensor, n=max_kp)
+    
+        # Asegurar formato [1, N, ...] que espera KF.LightGlue
+        if keypoints.ndim == 2:
+            keypoints = keypoints.unsqueeze(0)
+        if descriptors.ndim == 2:
+            descriptors = descriptors.unsqueeze(0)
+    
+        feats = {
+            "keypoints": keypoints,
+            "descriptors": descriptors,
+            "image_size": torch.tensor([img.shape[1], img.shape[0]]).view(1, 2).to(DEVICE)
+        }
+    else:
+        # 2. Librería LightGlue estándar (ALIKED, SuperPoint, DISK, SIFT)
+        # Esta librería prefiere su propio conversor
+        image_tensor = numpy_image_to_torch(img).to(DEVICE)
         feats = extractor.extract(image_tensor)
+        
     return feats
 
 # --- 4. FUNCIONES DE INGESTA (OFFLINE) ---
 def index_product_offline(sku, name, category, image_path, view_name="frente"):
     
-    # img_bgr = cv2.imread(image_path)
-    # if img_bgr is None:
-    #     raise ValueError(f"No se pudo leer la imagen: {image_path}")
-    # img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
     try:
         pil_img = Image.open(image_path).convert("RGB")
         # --- PARCHE DE ROTACIÓN EXIF ---
@@ -151,32 +190,43 @@ def index_product_offline(sku, name, category, image_path, view_name="frente"):
     except Exception as e:
         raise ValueError(f"No se pudo leer la imagen con Pillow: {image_path}. Error: {e}")
 
-    vec_visual = get_dinov2_embedding_from_array(img_rgb)
-    context = f"Product: {name}. Category: {category}. Packaging view: {view_name}."
-    vec_layout = get_qwen_layout_embedding_from_array(img_rgb, metadata_text=context)
-    
-    feats = extract_aliked_features_from_array(img_rgb)
-    feats_cpu = {k: v.cpu() for k, v in feats.items() if isinstance(v, torch.Tensor)}
-    
-    safe_img_name = os.path.basename(image_path).replace(".", "_")
-    feat_path = os.path.join(CACHE_DIR, f"{sku}_{safe_img_name}_aliked.pt")
-    torch.save(feats_cpu, feat_path)
-    
-    point_id = str(uuid.uuid4())
-    qdrant.upsert(
-        collection_name=COLLECTION_NAME,
-        points=[PointStruct(
-            id=point_id, 
-            vector={"dinov2": vec_visual.tolist(), "qwen_layout": vec_layout.tolist()}, 
-            payload={
-                "sku": sku, 
-                "name": name, 
-                "view": view_name,
-                "image_path": image_path,
-                "aliked_path": feat_path 
-            }
-        )]
-    )
+    try:
+        vec_visual = get_dinov2_embedding_from_array(img_rgb)
+        context = f"Product: {name}. Category: {category}. Packaging view: {view_name}."
+        vec_layout = get_qwen_layout_embedding_from_array(img_rgb, metadata_text=context)
+        
+        feats = extract_local_features_from_array(img_rgb)
+        feats_cpu = {k: v.cpu() for k, v in feats.items() if isinstance(v, torch.Tensor)}
+        
+        feat_type = cfg['models']['local_features']['type'].lower()
+        safe_img_name = os.path.basename(image_path).replace(".", "_")
+        feat_path = os.path.join(CACHE_DIR, f"{sku}_{safe_img_name}_{feat_type}.pt") # Nombre dinámico
+        torch.save(feats_cpu, feat_path)
+        
+        point_id = str(uuid.uuid4())
+        qdrant.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[PointStruct(
+                id=point_id, 
+                vector={"dinov2": vec_visual.tolist(), "qwen_layout": vec_layout.tolist()}, 
+                payload={
+                    "sku": sku, 
+                    "name": name, 
+                    "view": view_name,
+                    "image_path": image_path,
+                    "feature_path": feat_path
+                }
+            )]
+        )
+    finally:
+        # 🧹 LIMPIEZA EXTREMA POR CADA PRODUCTO INGESTADO
+        if 'feats' in locals(): del feats
+        if 'feats_cpu' in locals(): del feats_cpu
+        if 'img_rgb' in locals(): del img_rgb
+        
+        gc.collect() # Obliga a Python a limpiar la RAM
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache() # Obliga a la GPU a limpiar la VRAM
 
 def batch_ingest_catalog():
     catalog_dir = cfg['system']['catalog_dir']
@@ -256,49 +306,253 @@ def query_online_multimodal_cached(img_crop_rgb):
         return None
         
     top_embedding_hit = search_results[0]
-    query_feats = extract_aliked_features_from_array(img_crop_rgb)
+    query_feats = extract_local_features_from_array(img_crop_rgb)
     
     best_match = None
     min_inliers_valid = cfg['pipeline']['verification']['min_inliers_valid']
-    max_inliers = min_inliers_valid - 1 
+    max_inliers_found = 0 
+
+    feat_type = cfg['models']['local_features']['type'].lower()
     
+    # Verificación Fina (¡Unificada para todos los modelos!)
     for hit in search_results:
-        cand_feat_path = hit.payload["aliked_path"]
+        cand_feat_path = hit.payload.get("feature_path")
+        
+        if not cand_feat_path:
+            continue
+            
         try:
             cand_feats = torch.load(cand_feat_path, map_location=DEVICE, weights_only=False)
         except Exception:
             continue
 
         with torch.inference_mode():
-            matches01 = matcher({"image0": query_feats, "image1": cand_feats})
-            
-        matches01 = rbd(matches01)
-        matches = matches01['matches'] 
+            # Llamada común (ambos matchers aceptan el mismo dict)
+            matches01_raw = matcher({"image0": query_feats, "image1": cand_feats})
+    
+            # ← CORRECCIÓN: branching según tipo (esto era lo que rompía todo)
+            if feat_type == "dedode":
+                # KF.LightGlue output
+                matches = matches01_raw["matches"][0]          # tensor [M, 2]
+            else:
+                # LightGlue original (ALIKED/SuperPoint/etc.)
+                matches01 = rbd(matches01_raw)
+                matches = matches01['matches']                 # también [M, 2]
+    
+            if len(matches) < cfg['pipeline']['verification']['min_matches_lightglue']:
+                continue
         
-        if len(matches) < cfg['pipeline']['verification']['min_matches_lightglue']:
-            continue
-            
-        pts0 = query_feats['keypoints'][0][matches[..., 0]].cpu().numpy()
-        pts1 = cand_feats['keypoints'][0][matches[..., 1]].cpu().numpy()
+            # Ahora matches es [M, 2] en ambos casos → mismo slicing
+            pts0 = query_feats['keypoints'][0][matches[:, 0]].cpu().numpy()
+            pts1 = cand_feats['keypoints'][0][matches[:, 1]].cpu().numpy()
         
+        # Validación con Homografía (MAGSAC++)
+        # Los puntos ya vienen en píxeles, listos para OpenCV
         H, mask = cv2.findHomography(pts0, pts1, cv2.USAC_MAGSAC, cfg['pipeline']['verification']['ransac_threshold'])
         if mask is None:
             continue
             
         inliers = mask.sum()
         
-        if inliers > max_inliers:
-            max_inliers = inliers
-            best_match = hit.payload.copy()
-            best_match["inliers"] = int(inliers)
-            best_match["fusion_score"] = float(hit.score)
-            
+        if inliers > max_inliers_found:
+            max_inliers_found = inliers
+        
+        if inliers >= min_inliers_valid:
+            if best_match is None or inliers > best_match["inliers"]:
+                best_match = hit.payload.copy()
+                best_match["inliers"] = int(inliers)
+                best_match["fusion_score"] = float(hit.score)
+                
+    # Respuesta Final
     if best_match:
         best_match["verified"] = True
         return best_match
     else:
         fallback_match = top_embedding_hit.payload.copy()
         fallback_match["fusion_score"] = float(top_embedding_hit.score)
-        fallback_match["inliers"] = int(max_inliers) if max_inliers > 0 else 0 
+        fallback_match["inliers"] = int(max_inliers_found)
         fallback_match["verified"] = False
         return fallback_match
+
+# def query_online_multimodal_cached(img_crop_rgb):
+#     vec_visual = get_dinov2_embedding_from_array(img_crop_rgb)
+#     vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text="Find matching retail packaging.")
+    
+#     top_k = cfg['pipeline']['retrieval']['top_k']
+#     search_results = qdrant.query_points(
+#         collection_name=COLLECTION_NAME,
+#         prefetch=[
+#             models.Prefetch(query=vec_visual.tolist(), using="dinov2", limit=top_k),
+#             models.Prefetch(query=vec_layout.tolist(), using="qwen_layout", limit=top_k)
+#         ],
+#         query=models.FusionQuery(fusion=models.Fusion.RRF),
+#         limit=top_k,
+#         with_vectors=True 
+#     ).points
+    
+#     if not search_results:
+#         return None
+        
+#     top_embedding_hit = search_results[0]
+#     query_feats = extract_local_features_from_array(img_crop_rgb)
+    
+#     best_match = None
+#     min_inliers_valid = cfg['pipeline']['verification']['min_inliers_valid']
+#     max_inliers_found = 0 
+    
+#     feat_type = cfg['models']['local_features']['type'].lower()
+    
+#     # Verificación Fina
+#     for hit in search_results:
+#         cand_feat_path = hit.payload.get("feature_path")
+        
+#         if not cand_feat_path:
+#             continue
+            
+#         try:
+#             cand_feats = torch.load(cand_feat_path, map_location=DEVICE, weights_only=False)
+#         except Exception:
+#             continue
+
+#         with torch.inference_mode():
+#             if feat_type == "dedode":
+#                 # LÓGICA DE KORNIA PARA DEDODE
+#                 lafs0 = KF.laf_from_center_scale_ori(query_feats['keypoints'])
+#                 lafs1 = KF.laf_from_center_scale_ori(cand_feats['keypoints'])
+                
+#                 # ✅ SOLUCIÓN: Usamos el [Ancho, Alto] exacto de la imagen redimensionada
+#                 # que guardamos nativamente durante la extracción.
+#                 size0 = query_feats.get("image_size")
+#                 size1 = cand_feats.get("image_size")
+
+#                 # Pasamos los tamaños perfectos a LightGlue
+#                 dists, idxs = matcher(
+#                     query_feats['descriptors'], 
+#                     cand_feats['descriptors'], 
+#                     lafs0, lafs1,
+#                     hw1=size0, hw2=size1
+#                 )
+                
+#                 if isinstance(idxs, list):
+#                     idxs = idxs[0]
+#                 elif idxs.dim() == 3:
+#                     idxs = idxs[0]
+                    
+#                 if len(idxs) < cfg['pipeline']['verification']['min_matches_lightglue']:
+#                     continue
+                    
+#                 pts0 = query_feats['keypoints'][0][idxs[:, 0]].cpu().numpy()
+#                 pts1 = cand_feats['keypoints'][0][idxs[:, 1]].cpu().numpy()
+
+#             else:
+#                 # LÓGICA ESTÁNDAR PARA ALIKED / SUPERPOINT
+#                 matches01 = matcher({"image0": query_feats, "image1": cand_feats})
+#                 matches01 = rbd(matches01)
+#                 matches = matches01['matches'] 
+                
+#                 if len(matches) < cfg['pipeline']['verification']['min_matches_lightglue']:
+#                     continue
+                    
+#                 pts0 = query_feats['keypoints'][0][matches[..., 0]].cpu().numpy()
+#                 pts1 = cand_feats['keypoints'][0][matches[..., 1]].cpu().numpy()
+        
+#         # Validación con Homografía (MAGSAC++)
+#         H, mask = cv2.findHomography(pts0, pts1, cv2.USAC_MAGSAC, cfg['pipeline']['verification']['ransac_threshold'])
+#         if mask is None:
+#             continue
+            
+#         inliers = mask.sum()
+        
+#         if inliers > max_inliers_found:
+#             max_inliers_found = inliers
+        
+#         if inliers >= min_inliers_valid:
+#             if best_match is None or inliers > best_match["inliers"]:
+#                 best_match = hit.payload.copy()
+#                 best_match["inliers"] = int(inliers)
+#                 best_match["fusion_score"] = float(hit.score)
+                
+#     # Respuesta Final
+#     if best_match:
+#         best_match["verified"] = True
+#         return best_match
+#     else:
+#         fallback_match = top_embedding_hit.payload.copy()
+#         fallback_match["fusion_score"] = float(top_embedding_hit.score)
+#         fallback_match["inliers"] = int(max_inliers_found)
+#         fallback_match["verified"] = False
+#         return fallback_match
+
+
+# def query_online_multimodal_cached(img_crop_rgb):
+#     vec_visual = get_dinov2_embedding_from_array(img_crop_rgb)
+#     vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text="Find matching retail packaging.")
+    
+#     top_k = cfg['pipeline']['retrieval']['top_k']
+#     search_results = qdrant.query_points(
+#         collection_name=COLLECTION_NAME,
+#         prefetch=[
+#             models.Prefetch(query=vec_visual.tolist(), using="dinov2", limit=top_k),
+#             models.Prefetch(query=vec_layout.tolist(), using="qwen_layout", limit=top_k)
+#         ],
+#         query=models.FusionQuery(fusion=models.Fusion.RRF),
+#         limit=top_k,
+#         with_vectors=True 
+#     ).points
+    
+#     if not search_results:
+#         return None
+        
+#     top_embedding_hit = search_results[0]
+#     query_feats = extract_local_features_from_array(img_crop_rgb)
+    
+#     best_match = None
+#     min_inliers_valid = cfg['pipeline']['verification']['min_inliers_valid']
+#     max_inliers = min_inliers_valid - 1 
+    
+#     # Verificación Fina
+#     for hit in search_results:
+#         # Usamos .get() por seguridad y buscamos la llave nueva
+#         cand_feat_path = hit.payload.get("feature_path") # ✅ SOLUCIONADO
+        
+#         if not cand_feat_path:
+#             continue
+#         try:
+#             cand_feats = torch.load(cand_feat_path, map_location=DEVICE, weights_only=False)
+#         except Exception:
+#             continue
+
+#         with torch.inference_mode():
+#             matches01 = matcher({"image0": query_feats, "image1": cand_feats})
+            
+#         matches01 = rbd(matches01)
+#         matches = matches01['matches'] 
+        
+#         if len(matches) < cfg['pipeline']['verification']['min_matches_lightglue']:
+#             continue
+            
+#         pts0 = query_feats['keypoints'][0][matches[..., 0]].cpu().numpy()
+#         pts1 = cand_feats['keypoints'][0][matches[..., 1]].cpu().numpy()
+        
+#         H, mask = cv2.findHomography(pts0, pts1, cv2.USAC_MAGSAC, cfg['pipeline']['verification']['ransac_threshold'])
+#         if mask is None:
+#             continue
+            
+#         inliers = mask.sum()
+        
+#         if inliers > max_inliers:
+#             max_inliers = inliers
+#             best_match = hit.payload.copy()
+#             best_match["inliers"] = int(inliers)
+#             best_match["fusion_score"] = float(hit.score)
+            
+#     if best_match:
+#         best_match["verified"] = True
+#         return best_match
+#     else:
+#         fallback_match = top_embedding_hit.payload.copy()
+#         fallback_match["fusion_score"] = float(top_embedding_hit.score)
+#         fallback_match["inliers"] = int(max_inliers) if max_inliers > 0 else 0 
+#         fallback_match["verified"] = False
+#         return fallback_match
+

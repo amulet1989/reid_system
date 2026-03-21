@@ -2,6 +2,8 @@ import os
 import base64
 import cv2
 import numpy as np
+import torch 
+import gc    
 from celery import Celery
 from celery.signals import worker_process_init
 
@@ -72,6 +74,24 @@ def predict_bboxes_task(image_b64: str, bboxes: list):
         
     except Exception as e:
         return {"status": "error", "message": str(e)}
+        
+    finally:
+        # 🧹 PROTOCOLO DE LIMPIEZA EXTREMA (Se ejecuta SIEMPRE, al terminar o fallar)
+        # Limpiamos las variables temporales gigantes si existen en el entorno local
+        if 'img_bgr' in locals(): del img_bgr
+        if 'img_rgb' in locals(): del img_rgb
+        if 'img_crop' in locals(): del img_crop
+        if 'nparr' in locals(): del nparr
+        if 'img_data' in locals(): del img_data
+        
+        # 1. Forzar al Garbage Collector de Python a limpiar RAM del sistema
+        gc.collect() 
+        
+        # 2. Vaciar la caché de PyTorch para liberar la VRAM de la GPU
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
 
 @celery_app.task(name="tasks.sync_catalog")
 def sync_catalog_task():

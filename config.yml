@@ -8,7 +8,7 @@ system:
   csv_path: "/app/data/Catalogo.csv"
 
 database:
-  collection_name: "products_sota_pipeline"
+  collection_name: "products_sota_pipeline_sp"
 
 models:
   dinov2:
@@ -20,10 +20,10 @@ models:
     id: "Qwen/Qwen3-VL-Embedding-2B"
     max_image_size: 1024
     vector_size: 2048
-  aliked:
-    model_name: "aliked-n16rot"
-    max_num_keypoints: 4096
-    detection_threshold: 0.2
+  local_features:
+    type: "superpoint"  # Opciones soportadas: "aliked", "superpoint", "dedode"
+    max_num_keypoints: 2048
+    detection_threshold: 0.2 # Usado por ALIKED y SuperPoint
     max_image_size: 1024
 
 pipeline:
