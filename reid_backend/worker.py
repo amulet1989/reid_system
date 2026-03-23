@@ -1,11 +1,11 @@
 import os
-import base64
 import cv2
 import numpy as np
 import torch 
 import gc    
 from celery import Celery
 from celery.signals import worker_process_init
+from PIL import Image, ImageOps
 
 # Importamos nuestro pipeline maestro
 import pipeline
@@ -36,34 +36,27 @@ def load_models_on_start(**kwargs):
     pipeline.init_system()
 
 @celery_app.task(name="tasks.predict_bboxes")
-def predict_bboxes_task(image_b64: str, bboxes: list):
+def predict_bboxes_task(image_path: str, bboxes: list): # 👈 NUEVO: Recibe image_path
     """
-    Recibe una imagen codificada en Base64 y una lista de Bounding Boxes.
-    Decodifica la imagen en RAM y procesa cada recorte.
-    bboxes format: [[x1, y1, x2, y2], [x1, y1, x2, y2], ...]
+    Recibe la ruta física de una imagen temporal y una lista de Bounding Boxes.
+    Lee la imagen del disco compartido, la procesa y elimina el archivo.
     """
     try:
-        # 1. Decodificar la imagen Base64 a NumPy Array en memoria (sin tocar el disco)
-        img_data = base64.b64decode(image_b64)
-        nparr = np.frombuffer(img_data, np.uint8)
-        img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if img_bgr is None:
-            return {"error": "No se pudo decodificar la imagen Base64."}
-            
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        # 🚀 REEMPLAZO: Leemos con Pillow y horneamos el EXIF en lugar de cv2.imread
+        try:
+            pil_img = Image.open(image_path).convert("RGB")
+            pil_img = ImageOps.exif_transpose(pil_img) # Hornear rotación física
+            img_rgb = np.array(pil_img)
+        except Exception as e:
+            return {"error": f"No se pudo leer la imagen desde el volumen: {image_path}. Error: {e}"}
         
         results = []
         
-        # 2. Iterar sobre cada BBox detectado
+        # Iterar sobre cada BBox detectado
         for i, bbox in enumerate(bboxes):
-            # Recortar la imagen en memoria
             img_crop = pipeline.crop_bbox(img_rgb, bbox)
-            
-            # Pasar el recorte al pipeline multimodal
             match = pipeline.query_online_multimodal_cached(img_crop)
             
-            # Guardamos el resultado asociado a su BBox original
             results.append({
                 "bbox_index": i,
                 "bbox_coords": bbox,
@@ -76,18 +69,24 @@ def predict_bboxes_task(image_b64: str, bboxes: list):
         return {"status": "error", "message": str(e)}
         
     finally:
-        # 🧹 PROTOCOLO DE LIMPIEZA EXTREMA (Se ejecuta SIEMPRE, al terminar o fallar)
-        # Limpiamos las variables temporales gigantes si existen en el entorno local
+        # 🧹 PROTOCOLO DE LIMPIEZA EXTREMA V2 (Disco + VRAM)
+        
+        # 👈 NUEVO: Eliminar el archivo temporal para no saturar el SSD
+        if os.path.exists(image_path):
+            try:
+                os.remove(image_path)
+            except Exception as e:
+                print(f"Warning: No se pudo eliminar {image_path}: {e}")
+
+        # Limpiamos las variables temporales
         if 'img_bgr' in locals(): del img_bgr
         if 'img_rgb' in locals(): del img_rgb
         if 'img_crop' in locals(): del img_crop
-        if 'nparr' in locals(): del nparr
-        if 'img_data' in locals(): del img_data
         
-        # 1. Forzar al Garbage Collector de Python a limpiar RAM del sistema
+        # Forzar al Garbage Collector
         gc.collect() 
         
-        # 2. Vaciar la caché de PyTorch para liberar la VRAM de la GPU
+        # Vaciar la caché de PyTorch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()

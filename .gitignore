@@ -23,6 +23,7 @@ miniconda3/
 data/features_cache/
 data/qdrant_storage/
 data/Catalogo/
+tmp_queries/
 *.csv
 
 # =========================

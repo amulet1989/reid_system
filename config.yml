@@ -8,28 +8,36 @@ system:
   csv_path: "/app/data/Catalogo.csv"
 
 database:
-  collection_name: "products_sota_pipeline_sp"
+  collection_name: "products_sota_pipeline_aliked_v3"
 
 models:
   dinov2:
     repo: "facebookresearch/dinov2"
-    name: "dinov2_vitb14"
+    name: "dinov2_vitl14" #  "dinov2_vitb14" or "dinov2_vitl14" 
     image_size: 518
-    vector_size: 768
+    vector_size: 1024 # DINOv2-B14 tiene 768 dimensiones, DINOv2-L14 tiene 1024
   qwen:
     id: "Qwen/Qwen3-VL-Embedding-2B"
-    max_image_size: 1024
+    max_image_size: 4096
     vector_size: 2048
+    # 🚀 Prompt táctico extraído del código
+    # prompt: "You are a retail product expert. Analyze this packaging. Pay extreme attention to text differences: exact brand, specific flavor/variant, and the exact net weight/volume (e.g., grams, ml, oz). Context: {metadata_text}"
+    prompt: "Extract all text, brand names, and analyze the layout of this retail product packaging. Context: {metadata_text}"
   local_features:
     type: "superpoint"  # Opciones soportadas: "aliked", "superpoint", "dedode"
     max_num_keypoints: 2048
     detection_threshold: 0.2 # Usado por ALIKED y SuperPoint
-    max_image_size: 1024
+    max_image_size: 4096
 
 pipeline:
   retrieval:
     top_k: 40
+    # 🚀 NUEVO: Configuración del Re-Ranking K-Recíproco
+    re_ranking:
+      enabled: true
+      k1: 10              # Tamaño del vecindario para buscar reciprocidad
+      lambda_weight: 0.3  # Peso entre Jaccard (0.7) y Distancia Original (0.3)
   verification:
     min_matches_lightglue: 10
     ransac_threshold: 4.0
-    min_inliers_valid: 10
+    min_inliers_valid: 14

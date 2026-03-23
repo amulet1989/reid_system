@@ -36,7 +36,8 @@ services:
       - .env
     volumes:
       - ./config.yml:/app/config.yml:ro
-      - ./data:/app/data:ro    
+      - ./data:/app/data:ro   
+      - ./tmp_queries:/app/tmp_queries  # 👈 NUEVO: Buzón compartido 
     depends_on:
       - redis
       - vector_db
@@ -54,6 +55,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./config.yml:/app/config.yml:ro
+      - ./tmp_queries:/app/tmp_queries  # 👈 NUEVO: Buzón compartido
     depends_on:
       - redis
       - vector_db

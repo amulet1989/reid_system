@@ -1,4 +1,6 @@
 import os
+import uuid
+import base64
 from fastapi.responses import FileResponse
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +31,10 @@ celery_client = Celery(
     backend=os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
 )
 
+# Asegurar que el buzón exista al arrancar
+TMP_DIR = "/app/tmp_queries"
+os.makedirs(TMP_DIR, exist_ok=True)
+
 # 2. Modelos de Datos (Validación Pydantic)
 class PredictRequest(BaseModel):
     image_b64: str = Field(..., description="Imagen original codificada en Base64")
@@ -41,19 +47,31 @@ class PredictRequest(BaseModel):
 @app.post("/api/v1/predict", summary="Enviar imagen y BBoxes para clasificación")
 async def predict_products(request: PredictRequest):
     """
-    Recibe la imagen y los recortes, y los envía a la cola de la GPU.
-    Devuelve un task_id inmediatamente (Latencia ~10ms).
+    Recibe la imagen y los recortes. Guarda la imagen en un volumen compartido
+    y envía SOLO la ruta física a la cola de la GPU para ahorrar RAM.
     """
     if not request.bboxes:
         raise HTTPException(status_code=400, detail="Debe proporcionar al menos un Bounding Box.")
     
-    # Enviar tarea a la cola (El nombre debe coincidir EXACTAMENTE con el del worker.py)
-    task = celery_client.send_task(
-        "tasks.predict_bboxes",
-        args=[request.image_b64, request.bboxes]
-    )
-    
-    return {"message": "Trabajo encolado exitosamente", "task_id": task.id}
+    try:
+        # 👈 NUEVO: Guardar en disco y generar ruta
+        unique_filename = f"{uuid.uuid4().hex}.jpg"
+        image_path = os.path.join(TMP_DIR, unique_filename)
+        
+        img_data = base64.b64decode(request.image_b64)
+        with open(image_path, "wb") as f:
+            f.write(img_data)
+            
+        # 👈 NUEVO: Enviar 'image_path' en lugar de 'request.image_b64'
+        task = celery_client.send_task(
+            "tasks.predict_bboxes",
+            args=[image_path, request.bboxes]
+        )
+        
+        return {"message": "Trabajo encolado exitosamente", "task_id": task.id}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al procesar la imagen: {str(e)}")
 
 @app.get("/api/v1/results/{task_id}", summary="Consultar el resultado de un trabajo")
 async def get_results(task_id: str):

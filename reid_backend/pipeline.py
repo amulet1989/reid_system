@@ -8,6 +8,7 @@ from PIL import Image, ImageOps
 from tqdm import tqdm
 import gc
 import torchvision.transforms as T
+import torch.nn.functional as F
 from transformers import AutoProcessor, AutoModel
 from lightglue import LightGlue, ALIKED, SuperPoint
 from lightglue.utils import numpy_image_to_torch, rbd
@@ -36,6 +37,18 @@ qwen_model = None
 extractor = None
 matcher = None
 
+# Clase para mantener el Aspect Ratio 
+class SquarePad:
+    def __call__(self, image):
+        # image shape es [C, H, W] después de ToTensor()
+        _, h, w = image.shape
+        max_wh = max(w, h)
+        pad_left = (max_wh - w) // 2
+        pad_right = max_wh - w - pad_left
+        pad_top = (max_wh - h) // 2
+        pad_bottom = max_wh - h - pad_top
+        return F.pad(image, (pad_left, pad_right, pad_top, pad_bottom), value=0)
+
 # --- 2. INICIALIZACIÓN DEL SISTEMA ---
 def init_system():
     """
@@ -53,6 +66,7 @@ def init_system():
     dino_size = cfg['models']['dinov2']['image_size']
     dinov2_transform = T.Compose([
         T.ToTensor(),
+        SquarePad(), # Rellena con negro antes de redimensionar
         T.Resize((dino_size, dino_size), antialias=True),
         T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
@@ -126,7 +140,11 @@ def get_qwen_layout_embedding_from_array(img_rgb, metadata_text=""):
     if max(image.size) > max_size:
         image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
         
-    raw_prompt = f"Extract all text, brand names, and analyze the layout of this retail product packaging. Context: {metadata_text}"
+    # raw_prompt = f"Extract all text, brand names, and analyze the layout of this retail product packaging. Context: {metadata_text}"
+    # 🚀 NUEVO: Leemos el prompt desde YAML y le inyectamos el contexto
+    base_prompt = cfg['models']['qwen']['prompt']
+    raw_prompt = base_prompt.format(metadata_text=metadata_text)
+
     messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": raw_prompt}]}]
     
     text_prompt = qwen_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -153,22 +171,30 @@ def extract_local_features_from_array(img_rgb):
     feat_type = cfg['models']['local_features']['type'].lower()
     
     if feat_type == "dedode":
-        image_tensor = T.ToTensor()(img).unsqueeze(0).to(DEVICE)
+        image_tensor = T.ToTensor()(img).unsqueeze(0).to(DEVICE)  # [0,1] → DeDoDe lo normaliza internamente
     
         max_kp = cfg['models']['local_features']['max_num_keypoints']
-        # ← CORRECCIÓN: usar named argument + forzar batch dim (KF.LightGlue lo exige)
-        keypoints, scores, descriptors = extractor(image_tensor, n=max_kp)
     
-        # Asegurar formato [1, N, ...] que espera KF.LightGlue
+        # with torch.inference_mode():
+        keypoints, scores = extractor.detect(image_tensor, n=max_kp)
+        descriptors = extractor.describe(image_tensor, keypoints=keypoints)
+    
+        # 1. Aseguramos batch dim (DeDoDe devuelve sin batch aunque la entrada tenga B=1)
         if keypoints.ndim == 2:
             keypoints = keypoints.unsqueeze(0)
-        if descriptors.ndim == 2:
+            scores = scores.unsqueeze(0)
             descriptors = descriptors.unsqueeze(0)
     
+        # 2. ¡LA CLAVE! Convertimos coordenadas normalizadas [0,1] → píxeles absolutos
+        #    (igual que ALIKED/SuperPoint, para que homografía y MAGSAC funcionen)
+        image_size_tensor = torch.tensor([img.shape[1], img.shape[0]], device=DEVICE).view(1, 2)
+        keypoints = keypoints * image_size_tensor.unsqueeze(1)   # broadcasting mágico
+    
         feats = {
-            "keypoints": keypoints,
+            "keypoints": keypoints,      # ← ahora en píxeles
             "descriptors": descriptors,
-            "image_size": torch.tensor([img.shape[1], img.shape[0]]).view(1, 2).to(DEVICE)
+            "scores": scores,
+            "image_size": image_size_tensor
         }
     else:
         # 2. Librería LightGlue estándar (ALIKED, SuperPoint, DISK, SIFT)
@@ -286,6 +312,83 @@ def crop_bbox(image_rgb, bbox):
     x2, y2 = min(w, x2), min(h, y2)
     return image_rgb[y1:y2, x1:x2]
 
+# Reranking local k-reciprocal basado en DINOv2 + Qwen-VL, pero solo entre los candidatos top-K recuperados por Qdrant.
+def local_k_reciprocal_re_ranking(vec_visual, vec_layout, search_results):
+    """
+    Aplica el algoritmo k-reciprocal re-ranking (Zhong et al.) de forma ultra-ligera
+    restringido al sub-espacio topológico de los candidatos recuperados por Qdrant.
+    """
+    K = len(search_results)
+    if K == 0:
+        return search_results
+        
+    cfg_rr = cfg['pipeline']['retrieval']['re_ranking']
+    k1 = min(cfg_rr['k1'], K)
+    lambda_weight = cfg_rr['lambda_weight']
+    
+    dim_dino = len(vec_visual)
+    dim_qwen = len(vec_layout)
+    
+    # 1. Construir matrices locales: [Query, Cand_1, Cand_2, ..., Cand_K]
+    all_dino = np.zeros((K + 1, dim_dino))
+    all_qwen = np.zeros((K + 1, dim_qwen))
+    
+    all_dino[0] = vec_visual
+    all_qwen[0] = vec_layout
+    
+    for i, hit in enumerate(search_results):
+        vecs = hit.vector
+        all_dino[i+1] = vecs["dinov2"]
+        all_qwen[i+1] = vecs["qwen_layout"]
+        
+    # Normalización L2 segura
+    all_dino = all_dino / np.linalg.norm(all_dino, axis=1, keepdims=True)
+    all_qwen = all_qwen / np.linalg.norm(all_qwen, axis=1, keepdims=True)
+    
+    # 2. Calcular Distancia Original (Promedio de Cosine Distances multimodales)
+    sim_dino = np.dot(all_dino, all_dino.T)
+    sim_qwen = np.dot(all_qwen, all_qwen.T)
+    dist_matrix = 1.0 - ((sim_dino + sim_qwen) / 2.0) # Distancia original d(p, g_i)
+    
+    # 3. Encontrar vecindarios recíprocos y aplicar pesos Gaussianos
+    initial_rank = np.argsort(dist_matrix, axis=1) 
+    V = np.zeros((K + 1, K + 1))
+    
+    for i in range(K + 1):
+        forward_k_neighbors = initial_rank[i, :k1 + 1] 
+        for j in forward_k_neighbors:
+            backward_k_neighbors = initial_rank[j, :k1 + 1]
+            if i in backward_k_neighbors:
+                # Es recíproco. Aplicar Eq. 7 del paper
+                V[i, j] = np.exp(-dist_matrix[i, j])
+                
+    # 4. Calcular Distancia de Jaccard y Distancia Final (Eq. 10 y Eq. 12)
+    V_probe = V[0] 
+    re_ranked_hits = []
+    
+    for i in range(1, K + 1):
+        V_candidate = V[i]
+        
+        intersection = np.sum(np.minimum(V_probe, V_candidate))
+        union = np.sum(np.maximum(V_probe, V_candidate))
+        
+        jaccard_dist = 1.0 if union == 0 else 1.0 - (intersection / union)
+        
+        # Eq. 12 del paper: Combinación ponderada
+        final_dist = (1 - lambda_weight) * jaccard_dist + lambda_weight * dist_matrix[0, i]
+        
+        # Convertir distancia a Score (mayor es mejor) para la lógica downstream
+        final_score = 1.0 - final_dist
+        
+        # Actualizamos el score del candidato
+        hit = search_results[i-1]
+        hit.score = float(final_score)
+        re_ranked_hits.append(hit)
+        
+    # Ordenar por el nuevo score k-recíproco
+    re_ranked_hits.sort(key=lambda x: x.score, reverse=True)
+    return re_ranked_hits
+
 def query_online_multimodal_cached(img_crop_rgb):
     vec_visual = get_dinov2_embedding_from_array(img_crop_rgb)
     vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text="Find matching retail packaging.")
@@ -304,6 +407,10 @@ def query_online_multimodal_cached(img_crop_rgb):
     
     if not search_results:
         return None
+    
+    # 🚀 NUEVO: Bloque de Re-Ranking K-Recíproco Topológico
+    if cfg['pipeline']['retrieval'].get('re_ranking', {}).get('enabled', False):
+        search_results = local_k_reciprocal_re_ranking(vec_visual, vec_layout, search_results)
         
     top_embedding_hit = search_results[0]
     query_feats = extract_local_features_from_array(img_crop_rgb)
@@ -313,6 +420,10 @@ def query_online_multimodal_cached(img_crop_rgb):
     max_inliers_found = 0 
 
     feat_type = cfg['models']['local_features']['type'].lower()
+
+    
+    # Lista para guardar todos los candidatos que superen la prueba geométrica
+    valid_matches = []
     
     # Verificación Fina (¡Unificada para todos los modelos!)
     for hit in search_results:
@@ -327,27 +438,20 @@ def query_online_multimodal_cached(img_crop_rgb):
             continue
 
         with torch.inference_mode():
-            # Llamada común (ambos matchers aceptan el mismo dict)
             matches01_raw = matcher({"image0": query_feats, "image1": cand_feats})
     
-            # ← CORRECCIÓN: branching según tipo (esto era lo que rompía todo)
             if feat_type == "dedode":
-                # KF.LightGlue output
-                matches = matches01_raw["matches"][0]          # tensor [M, 2]
+                matches = matches01_raw["matches"][0]
             else:
-                # LightGlue original (ALIKED/SuperPoint/etc.)
                 matches01 = rbd(matches01_raw)
-                matches = matches01['matches']                 # también [M, 2]
+                matches = matches01['matches'] 
     
             if len(matches) < cfg['pipeline']['verification']['min_matches_lightglue']:
                 continue
         
-            # Ahora matches es [M, 2] en ambos casos → mismo slicing
             pts0 = query_feats['keypoints'][0][matches[:, 0]].cpu().numpy()
             pts1 = cand_feats['keypoints'][0][matches[:, 1]].cpu().numpy()
         
-        # Validación con Homografía (MAGSAC++)
-        # Los puntos ya vienen en píxeles, listos para OpenCV
         H, mask = cv2.findHomography(pts0, pts1, cv2.USAC_MAGSAC, cfg['pipeline']['verification']['ransac_threshold'])
         if mask is None:
             continue
@@ -357,22 +461,112 @@ def query_online_multimodal_cached(img_crop_rgb):
         if inliers > max_inliers_found:
             max_inliers_found = inliers
         
+        # 🚀 CAMBIO: En lugar de elegir al ganador de inmediato, guardamos TODOS los que sean válidos
         if inliers >= min_inliers_valid:
-            if best_match is None or inliers > best_match["inliers"]:
-                best_match = hit.payload.copy()
-                best_match["inliers"] = int(inliers)
-                best_match["fusion_score"] = float(hit.score)
+            match_data = hit.payload.copy()
+            match_data["inliers"] = int(inliers)
+            match_data["fusion_score"] = float(hit.score)
+            valid_matches.append(match_data)
                 
+    # 🧠 LÓGICA DE DESEMPATE MULTIMODAL (TIE-BREAKER)
+    if valid_matches:
+        # 1. Ordenamos por inliers de mayor a menor para ver quién sacó la nota más alta
+        valid_matches.sort(key=lambda x: x["inliers"], reverse=True)
+        top_inliers = valid_matches[0]["inliers"]
+        
+        # 2. Definimos un "margen de empate" (ej. diferencia de 15% respecto al mejor, con un mínimo de 5 inliers)
+        # Si el mejor tiene 100 inliers, cualquiera con 85+ está en el empate.
+        # Si el mejor tiene 18, cualquiera con 13+ (18-5) entra al desempate.
+        margin = max(5, int(top_inliers * 0.15))
+        
+        # 3. Filtramos los candidatos que están dentro de este margen de empate técnico
+        tied_candidates = [m for m in valid_matches if m["inliers"] >= (top_inliers - margin)]
+        
+        # 4. De los empatados geométricamente, DINOv2 y Qwen eligen al ganador por color/texto
+        best_match = max(tied_candidates, key=lambda x: x["fusion_score"])
+        # best_match["verified"] = True
+    
     # Respuesta Final
     if best_match:
-        best_match["verified"] = True
+        # 🚀 REGLA DE VETO MULTIMODAL: 
+        # Si la geometría dice "Sí", pero DINO/Qwen dicen "Definitivamente No" (Score < 0.2)
+        if best_match["fusion_score"] < 0.2:
+            best_match["verified"] = False
+        else:
+            best_match["verified"] = True
+            
         return best_match
+        
     else:
+        # Fallback si nadie superó los inliers mínimos
         fallback_match = top_embedding_hit.payload.copy()
         fallback_match["fusion_score"] = float(top_embedding_hit.score)
         fallback_match["inliers"] = int(max_inliers_found)
         fallback_match["verified"] = False
         return fallback_match
+    
+    #·························
+    
+    # # Verificación Fina (¡Unificada para todos los modelos!)
+    # for hit in search_results:
+    #     cand_feat_path = hit.payload.get("feature_path")
+        
+    #     if not cand_feat_path:
+    #         continue
+            
+    #     try:
+    #         cand_feats = torch.load(cand_feat_path, map_location=DEVICE, weights_only=False)
+    #     except Exception:
+    #         continue
+
+    #     with torch.inference_mode():
+    #         # Llamada común (ambos matchers aceptan el mismo dict)
+    #         matches01_raw = matcher({"image0": query_feats, "image1": cand_feats})
+    
+    #         # ← CORRECCIÓN: branching según tipo (esto era lo que rompía todo)
+    #         if feat_type == "dedode":
+    #             # KF.LightGlue output
+    #             matches = matches01_raw["matches"][0]          # tensor [M, 2]
+    #         else:
+    #             # LightGlue original (ALIKED/SuperPoint/etc.)
+    #             matches01 = rbd(matches01_raw)
+    #             matches = matches01['matches']                 # también [M, 2]
+    
+    #         if len(matches) < cfg['pipeline']['verification']['min_matches_lightglue']:
+    #             continue
+        
+    #         # Ahora matches es [M, 2] en ambos casos → mismo slicing
+    #         pts0 = query_feats['keypoints'][0][matches[:, 0]].cpu().numpy()
+    #         pts1 = cand_feats['keypoints'][0][matches[:, 1]].cpu().numpy()
+        
+    #     # print("Longitud de matches:", len(matches))
+    #     # Validación con Homografía (MAGSAC++)
+    #     # Los puntos ya vienen en píxeles, listos para OpenCV
+    #     H, mask = cv2.findHomography(pts0, pts1, cv2.USAC_MAGSAC, cfg['pipeline']['verification']['ransac_threshold'])
+    #     if mask is None:
+    #         continue
+            
+    #     inliers = mask.sum()
+        
+    #     if inliers > max_inliers_found:
+    #         max_inliers_found = inliers
+        
+    #     if inliers >= min_inliers_valid:
+    #         if best_match is None or inliers > best_match["inliers"]:
+    #             best_match = hit.payload.copy()
+    #             best_match["inliers"] = int(inliers)
+    #             best_match["fusion_score"] = float(hit.score)
+                
+    # # Respuesta Final
+    # if best_match:
+    #     best_match["verified"] = True
+    #     return best_match
+    # else:
+    #     fallback_match = top_embedding_hit.payload.copy()
+    #     fallback_match["fusion_score"] = float(top_embedding_hit.score)
+    #     fallback_match["inliers"] = int(max_inliers_found)
+    #     fallback_match["verified"] = False
+    #     return fallback_match
 
 # def query_online_multimodal_cached(img_crop_rgb):
 #     vec_visual = get_dinov2_embedding_from_array(img_crop_rgb)

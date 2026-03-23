@@ -131,7 +131,7 @@ with col2:
         if st.button("🔍 Identificar Productos", type="primary", use_container_width=True):
             # 1. Preparar la imagen en Base64
             buffered = io.BytesIO()
-            image.save(buffered, format="JPEG")
+            image.save(buffered, format="JPEG", quality=95)
             img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
             
             payload = {"image_b64": img_b64, "bboxes": bboxes_to_send}
