@@ -64,12 +64,23 @@ def init_system():
     dinov2 = torch.hub.load(cfg['models']['dinov2']['repo'], cfg['models']['dinov2']['name']).to(DEVICE)
     dinov2.eval()
     dino_size = cfg['models']['dinov2']['image_size']
-    dinov2_transform = T.Compose([
-        T.ToTensor(),
-        SquarePad(), # Rellena con negro antes de redimensionar
-        T.Resize((dino_size, dino_size), antialias=True),
-        T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-    ])
+    # Obtener de cfg si uso SquarePad o Resize
+    use_square_pad = cfg['models']['dinov2'].get('use_square_pad', False)
+    if use_square_pad:
+        print("⚠️ DINOv2 configurado para usar SquarePad (manteniendo aspect ratio).")
+        dinov2_transform = T.Compose([
+            T.ToTensor(),
+            SquarePad(), # Mantiene el aspect ratio original 
+            T.Resize((dino_size, dino_size), antialias=True),
+            T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ])
+    else:
+        print("⚠️ DINOv2 configurado para usar Resize directo (puede distorsionar imágenes).")
+        dinov2_transform = T.Compose([
+            T.ToTensor(),
+            T.Resize((dino_size, dino_size), antialias=True),
+            T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ])
 
     print("🧠 Cargando Qwen-VL...")
     qwen_id = cfg['models']['qwen']['id']
