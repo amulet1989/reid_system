@@ -8,7 +8,7 @@ system:
   csv_path: "/app/data/Catalogo.csv"
 
 database:
-  collection_name: "products_sota_pipeline_aliked_v3"
+  collection_name: "products_sota_pipeline_sp_v1"
 
 models:
   dinov2:
@@ -22,8 +22,9 @@ models:
     max_image_size: 4096
     vector_size: 2048
     # 🚀 Prompt táctico extraído del código
-    # prompt: "You are a retail product expert. Analyze this packaging. Pay extreme attention to text differences: exact brand, specific flavor/variant, and the exact net weight/volume (e.g., grams, ml, oz). Context: {metadata_text}"
+    # prompt: "You are a retail product expert. Analyze this retail product packaging. Pay extreme attention to text differences: exact brand, specific flavor/variant, and the exact net weight/volume (e.g., grams, ml, oz). Context: {metadata_text}"
     prompt: "Extract all text, brand names, and analyze the layout of this retail product packaging. Context: {metadata_text}"
+    # prompt: "Read the exact brand, variant, and weight. Context: {metadata_text}"
   local_features:
     type: "superpoint"  # Opciones soportadas: "aliked", "superpoint", "dedode"
     max_num_keypoints: 2048

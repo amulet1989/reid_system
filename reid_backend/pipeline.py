@@ -229,7 +229,7 @@ def index_product_offline(sku, name, category, image_path, view_name="frente"):
 
     try:
         vec_visual = get_dinov2_embedding_from_array(img_rgb)
-        context = f"Product: {name}. Category: {category}. Packaging view: {view_name}."
+        context = "Reference retail product packaging from official catalog."
         vec_layout = get_qwen_layout_embedding_from_array(img_rgb, metadata_text=context)
         
         feats = extract_local_features_from_array(img_rgb)
@@ -402,7 +402,7 @@ def local_k_reciprocal_re_ranking(vec_visual, vec_layout, search_results):
 
 def query_online_multimodal_cached(img_crop_rgb):
     vec_visual = get_dinov2_embedding_from_array(img_crop_rgb)
-    vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text="Find matching retail packaging.")
+    vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text="Query retail product packaging from store shelf.")
     
     top_k = cfg['pipeline']['retrieval']['top_k']
     search_results = qdrant.query_points(
