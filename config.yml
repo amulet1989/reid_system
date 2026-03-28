@@ -4,11 +4,11 @@ system:
   device: "cuda"
   # Las rutas apuntan a /app/data porque así montaremos el volumen en Docker
   cache_dir: "/app/data/features_cache"
-  catalog_dir: "/app/data/Catalogo"
-  csv_path: "/app/data/Catalogo.csv"
+  catalog_dir: "/app/data/Catalogo_PM"
+  csv_path: "/app/data/Catalogo_PM.csv"
 
 database:
-  collection_name: "products_sota_pipeline_sp_v1"
+  collection_name: "catalogo_puerto_madero_en_p1"
 
 models:
   dinov2:
@@ -22,14 +22,17 @@ models:
     max_image_size: 4096
     vector_size: 2048
     # 🚀 Prompt táctico extraído del código
-    # prompt: "You are a retail product expert. Analyze this retail product packaging. Pay extreme attention to text differences: exact brand, specific flavor/variant, and the exact net weight/volume (e.g., grams, ml, oz). Context: {metadata_text}"
     prompt: "Extract all text, brand names, and analyze the layout of this retail product packaging. Context: {metadata_text}"
-    # prompt: "Read the exact brand, variant, and weight. Context: {metadata_text}"
+    context:
+      reference: "Reference retail product packaging from official catalog."
+      query: "Query retail product packaging from store shelf."
   local_features:
     type: "superpoint"  # Opciones soportadas: "aliked", "superpoint", "dedode"
     max_num_keypoints: 2048
     detection_threshold: 0.2 # Usado por ALIKED y SuperPoint
     max_image_size: 4096
+    preprocess:
+      use_clahe: false
 
 pipeline:
   retrieval:

@@ -155,6 +155,7 @@ def get_qwen_layout_embedding_from_array(img_rgb, metadata_text=""):
     # 🚀 NUEVO: Leemos el prompt desde YAML y le inyectamos el contexto
     base_prompt = cfg['models']['qwen']['prompt']
     raw_prompt = base_prompt.format(metadata_text=metadata_text)
+    # print(f"📝 Prompt para Qwen-VL: {raw_prompt}")
 
     messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": raw_prompt}]}]
     
@@ -174,6 +175,18 @@ def get_qwen_layout_embedding_from_array(img_rgb, metadata_text=""):
 def extract_local_features_from_array(img_rgb):
     img = img_rgb.copy()
     max_dim = cfg['models']['local_features']['max_image_size']
+
+    # --- [NUEVO] PREPROCESAMIENTO DINÁMICO ---
+    if cfg['models']['local_features']['preprocess'].get('use_clahe', False):
+        # print("⚙️ Aplicando preprocesamiento CLAHE para mejorar la detección de keypoints...")
+        # SuperPoint prefiere intensidad de textura sobre color
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        img_enhanced = clahe.apply(gray)
+        # Convertimos de vuelta a RGB para mantener compatibilidad con el resto del pipeline
+        img = cv2.cvtColor(img_enhanced, cv2.COLOR_GRAY2RGB)
+    # -----------------------------------------
+
     h, w = img.shape[:2]
     if max(h, w) > max_dim:
         scale = max_dim / max(h, w)
@@ -229,7 +242,9 @@ def index_product_offline(sku, name, category, image_path, view_name="frente"):
 
     try:
         vec_visual = get_dinov2_embedding_from_array(img_rgb)
-        context = "Reference retail product packaging from official catalog."
+        # context = "Reference retail product packaging from official catalog."
+        # context = "Empaque de producto minorista de referencia del catálogo oficial."
+        context = cfg['models']['qwen']['context']['reference']
         vec_layout = get_qwen_layout_embedding_from_array(img_rgb, metadata_text=context)
         
         feats = extract_local_features_from_array(img_rgb)
@@ -402,7 +417,10 @@ def local_k_reciprocal_re_ranking(vec_visual, vec_layout, search_results):
 
 def query_online_multimodal_cached(img_crop_rgb):
     vec_visual = get_dinov2_embedding_from_array(img_crop_rgb)
-    vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text="Query retail product packaging from store shelf.")
+    context = cfg['models']['qwen']['context']['query']
+    vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text=context)
+    # Consulta de empaque de producto minorista desde el estante de la tienda.
+    # Query retail product packaging from store shelf.
     
     top_k = cfg['pipeline']['retrieval']['top_k']
     search_results = qdrant.query_points(
@@ -457,7 +475,9 @@ def query_online_multimodal_cached(img_crop_rgb):
                 matches01 = rbd(matches01_raw)
                 matches = matches01['matches'] 
     
-            if len(matches) < cfg['pipeline']['verification']['min_matches_lightglue']:
+            # 1. FILTRO PREVIO: Si LightGlue no ve nada, fuera.
+            num_matches = len(matches)
+            if num_matches < cfg['pipeline']['verification']['min_matches_lightglue']:
                 continue
         
             pts0 = query_feats['keypoints'][0][matches[:, 0]].cpu().numpy()
@@ -469,13 +489,31 @@ def query_online_multimodal_cached(img_crop_rgb):
             
         inliers = mask.sum()
         
+        # if inliers > max_inliers_found:
+        #     max_inliers_found = inliers
+        
+        # # 🚀 CAMBIO: En lugar de elegir al ganador de inmediato, guardamos TODOS los que sean válidos
+        # if inliers >= min_inliers_valid:
+        #     match_data = hit.payload.copy()
+        #     match_data["inliers"] = int(inliers)
+        #     match_data["fusion_score"] = float(hit.score)
+        #     valid_matches.append(match_data)
+        
+        # --- [PUNTO 1: CONFIDENCE RATIO] ---
+        # Calculamos qué tan "limpio" es el match
+        conf_ratio = inliers / num_matches if num_matches > 0 else 0
+        
+        # Definimos si este candidato es GEOMÉTRICAMENTE SÓLIDO
+        # Regla: O tienes muchos inliers (>25) o tienes un ratio de éxito muy alto (>45%)
+        is_geometric_valid = (inliers >= min_inliers_valid) or (inliers >= 10 and conf_ratio > 0.5)
+        
         if inliers > max_inliers_found:
             max_inliers_found = inliers
-        
-        # 🚀 CAMBIO: En lugar de elegir al ganador de inmediato, guardamos TODOS los que sean válidos
-        if inliers >= min_inliers_valid:
+
+        if is_geometric_valid:
             match_data = hit.payload.copy()
-            match_data["inliers"] = int(inliers)
+            match_data["inliers"] = int(inliers)  # 🔥 El cast a int() de Python es vital aquí
+            match_data["conf_ratio"] = float(conf_ratio) # 🔥 Cast a float nativo por seguridad
             match_data["fusion_score"] = float(hit.score)
             valid_matches.append(match_data)
                 
@@ -489,22 +527,51 @@ def query_online_multimodal_cached(img_crop_rgb):
         # Si el mejor tiene 100 inliers, cualquiera con 85+ está en el empate.
         # Si el mejor tiene 18, cualquiera con 13+ (18-5) entra al desempate.
         margin = max(5, int(top_inliers * 0.15))
+        # margin = max(4, int(top_inliers * 0.10))
         
         # 3. Filtramos los candidatos que están dentro de este margen de empate técnico
         tied_candidates = [m for m in valid_matches if m["inliers"] >= (top_inliers - margin)]
         
         # 4. De los empatados geométricamente, DINOv2 y Qwen eligen al ganador por color/texto
         best_match = max(tied_candidates, key=lambda x: x["fusion_score"])
-        # best_match["verified"] = True
     
     # Respuesta Final
-    if best_match:
-        # 🚀 REGLA DE VETO MULTIMODAL: 
-        # Si la geometría dice "Sí", pero DINO/Qwen dicen "Definitivamente No" (Score < 0.2)
-        if best_match["fusion_score"] < 0.2:
-            best_match["verified"] = False
+    # if best_match:
+    #     # 🚀 REGLA DE VETO MULTIMODAL: 
+    #     # Si la geometría dice "Sí", pero DINO/Qwen dicen "Definitivamente No" (Score < 0.2)
+    #     if best_match["fusion_score"] < 0.2: # 0.2
+    #         best_match["verified"] = False
+    #     else:
+    #         best_match["verified"] = True
+            
+    #     return best_match
+
+    # ... (después de elegir el best_match)
+        
+        # 1. Extraemos los valores clave del ganador
+        final_inliers = best_match["inliers"]
+        final_score = best_match["fusion_score"]
+        
+        # 2. VETO DINÁMICO (La magia de confiar en la geometría)
+        best_match["verified"] = False # Asumimos falso por defecto
+        
+        if final_inliers >= 20:
+            # GEOMETRÍA ABRUMADORA
+            # Si RANSAC encontró más de 20 puntos alineados, es casi imposible que sea un error.
+            # Solo vetamos si el score multimodal es catastróficamente bajo (< 0.10)
+            if final_score >= 0.10:
+                best_match["verified"] = True
+                
+        elif final_inliers >= 14:
+            # GEOMETRÍA DUDOSA ("La Zona de Peligro")
+            # En tus datos, aquí están los errores entre productos hermanos.
+            # Necesitamos que DINO/Qwen estén MUY seguros para aprobarlo.
+            if final_score >= 0.35: 
+                best_match["verified"] = True       
         else:
-            best_match["verified"] = True
+            # INLIERS BAJOS (< 14)
+            # Nunca lo verificamos, es puro ruido estadístico.
+            best_match["verified"] = False
             
         return best_match
         
@@ -516,248 +583,4 @@ def query_online_multimodal_cached(img_crop_rgb):
         fallback_match["verified"] = False
         return fallback_match
     
-    #·························
     
-    # # Verificación Fina (¡Unificada para todos los modelos!)
-    # for hit in search_results:
-    #     cand_feat_path = hit.payload.get("feature_path")
-        
-    #     if not cand_feat_path:
-    #         continue
-            
-    #     try:
-    #         cand_feats = torch.load(cand_feat_path, map_location=DEVICE, weights_only=False)
-    #     except Exception:
-    #         continue
-
-    #     with torch.inference_mode():
-    #         # Llamada común (ambos matchers aceptan el mismo dict)
-    #         matches01_raw = matcher({"image0": query_feats, "image1": cand_feats})
-    
-    #         # ← CORRECCIÓN: branching según tipo (esto era lo que rompía todo)
-    #         if feat_type == "dedode":
-    #             # KF.LightGlue output
-    #             matches = matches01_raw["matches"][0]          # tensor [M, 2]
-    #         else:
-    #             # LightGlue original (ALIKED/SuperPoint/etc.)
-    #             matches01 = rbd(matches01_raw)
-    #             matches = matches01['matches']                 # también [M, 2]
-    
-    #         if len(matches) < cfg['pipeline']['verification']['min_matches_lightglue']:
-    #             continue
-        
-    #         # Ahora matches es [M, 2] en ambos casos → mismo slicing
-    #         pts0 = query_feats['keypoints'][0][matches[:, 0]].cpu().numpy()
-    #         pts1 = cand_feats['keypoints'][0][matches[:, 1]].cpu().numpy()
-        
-    #     # print("Longitud de matches:", len(matches))
-    #     # Validación con Homografía (MAGSAC++)
-    #     # Los puntos ya vienen en píxeles, listos para OpenCV
-    #     H, mask = cv2.findHomography(pts0, pts1, cv2.USAC_MAGSAC, cfg['pipeline']['verification']['ransac_threshold'])
-    #     if mask is None:
-    #         continue
-            
-    #     inliers = mask.sum()
-        
-    #     if inliers > max_inliers_found:
-    #         max_inliers_found = inliers
-        
-    #     if inliers >= min_inliers_valid:
-    #         if best_match is None or inliers > best_match["inliers"]:
-    #             best_match = hit.payload.copy()
-    #             best_match["inliers"] = int(inliers)
-    #             best_match["fusion_score"] = float(hit.score)
-                
-    # # Respuesta Final
-    # if best_match:
-    #     best_match["verified"] = True
-    #     return best_match
-    # else:
-    #     fallback_match = top_embedding_hit.payload.copy()
-    #     fallback_match["fusion_score"] = float(top_embedding_hit.score)
-    #     fallback_match["inliers"] = int(max_inliers_found)
-    #     fallback_match["verified"] = False
-    #     return fallback_match
-
-# def query_online_multimodal_cached(img_crop_rgb):
-#     vec_visual = get_dinov2_embedding_from_array(img_crop_rgb)
-#     vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text="Find matching retail packaging.")
-    
-#     top_k = cfg['pipeline']['retrieval']['top_k']
-#     search_results = qdrant.query_points(
-#         collection_name=COLLECTION_NAME,
-#         prefetch=[
-#             models.Prefetch(query=vec_visual.tolist(), using="dinov2", limit=top_k),
-#             models.Prefetch(query=vec_layout.tolist(), using="qwen_layout", limit=top_k)
-#         ],
-#         query=models.FusionQuery(fusion=models.Fusion.RRF),
-#         limit=top_k,
-#         with_vectors=True 
-#     ).points
-    
-#     if not search_results:
-#         return None
-        
-#     top_embedding_hit = search_results[0]
-#     query_feats = extract_local_features_from_array(img_crop_rgb)
-    
-#     best_match = None
-#     min_inliers_valid = cfg['pipeline']['verification']['min_inliers_valid']
-#     max_inliers_found = 0 
-    
-#     feat_type = cfg['models']['local_features']['type'].lower()
-    
-#     # Verificación Fina
-#     for hit in search_results:
-#         cand_feat_path = hit.payload.get("feature_path")
-        
-#         if not cand_feat_path:
-#             continue
-            
-#         try:
-#             cand_feats = torch.load(cand_feat_path, map_location=DEVICE, weights_only=False)
-#         except Exception:
-#             continue
-
-#         with torch.inference_mode():
-#             if feat_type == "dedode":
-#                 # LÓGICA DE KORNIA PARA DEDODE
-#                 lafs0 = KF.laf_from_center_scale_ori(query_feats['keypoints'])
-#                 lafs1 = KF.laf_from_center_scale_ori(cand_feats['keypoints'])
-                
-#                 # ✅ SOLUCIÓN: Usamos el [Ancho, Alto] exacto de la imagen redimensionada
-#                 # que guardamos nativamente durante la extracción.
-#                 size0 = query_feats.get("image_size")
-#                 size1 = cand_feats.get("image_size")
-
-#                 # Pasamos los tamaños perfectos a LightGlue
-#                 dists, idxs = matcher(
-#                     query_feats['descriptors'], 
-#                     cand_feats['descriptors'], 
-#                     lafs0, lafs1,
-#                     hw1=size0, hw2=size1
-#                 )
-                
-#                 if isinstance(idxs, list):
-#                     idxs = idxs[0]
-#                 elif idxs.dim() == 3:
-#                     idxs = idxs[0]
-                    
-#                 if len(idxs) < cfg['pipeline']['verification']['min_matches_lightglue']:
-#                     continue
-                    
-#                 pts0 = query_feats['keypoints'][0][idxs[:, 0]].cpu().numpy()
-#                 pts1 = cand_feats['keypoints'][0][idxs[:, 1]].cpu().numpy()
-
-#             else:
-#                 # LÓGICA ESTÁNDAR PARA ALIKED / SUPERPOINT
-#                 matches01 = matcher({"image0": query_feats, "image1": cand_feats})
-#                 matches01 = rbd(matches01)
-#                 matches = matches01['matches'] 
-                
-#                 if len(matches) < cfg['pipeline']['verification']['min_matches_lightglue']:
-#                     continue
-                    
-#                 pts0 = query_feats['keypoints'][0][matches[..., 0]].cpu().numpy()
-#                 pts1 = cand_feats['keypoints'][0][matches[..., 1]].cpu().numpy()
-        
-#         # Validación con Homografía (MAGSAC++)
-#         H, mask = cv2.findHomography(pts0, pts1, cv2.USAC_MAGSAC, cfg['pipeline']['verification']['ransac_threshold'])
-#         if mask is None:
-#             continue
-            
-#         inliers = mask.sum()
-        
-#         if inliers > max_inliers_found:
-#             max_inliers_found = inliers
-        
-#         if inliers >= min_inliers_valid:
-#             if best_match is None or inliers > best_match["inliers"]:
-#                 best_match = hit.payload.copy()
-#                 best_match["inliers"] = int(inliers)
-#                 best_match["fusion_score"] = float(hit.score)
-                
-#     # Respuesta Final
-#     if best_match:
-#         best_match["verified"] = True
-#         return best_match
-#     else:
-#         fallback_match = top_embedding_hit.payload.copy()
-#         fallback_match["fusion_score"] = float(top_embedding_hit.score)
-#         fallback_match["inliers"] = int(max_inliers_found)
-#         fallback_match["verified"] = False
-#         return fallback_match
-
-
-# def query_online_multimodal_cached(img_crop_rgb):
-#     vec_visual = get_dinov2_embedding_from_array(img_crop_rgb)
-#     vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text="Find matching retail packaging.")
-    
-#     top_k = cfg['pipeline']['retrieval']['top_k']
-#     search_results = qdrant.query_points(
-#         collection_name=COLLECTION_NAME,
-#         prefetch=[
-#             models.Prefetch(query=vec_visual.tolist(), using="dinov2", limit=top_k),
-#             models.Prefetch(query=vec_layout.tolist(), using="qwen_layout", limit=top_k)
-#         ],
-#         query=models.FusionQuery(fusion=models.Fusion.RRF),
-#         limit=top_k,
-#         with_vectors=True 
-#     ).points
-    
-#     if not search_results:
-#         return None
-        
-#     top_embedding_hit = search_results[0]
-#     query_feats = extract_local_features_from_array(img_crop_rgb)
-    
-#     best_match = None
-#     min_inliers_valid = cfg['pipeline']['verification']['min_inliers_valid']
-#     max_inliers = min_inliers_valid - 1 
-    
-#     # Verificación Fina
-#     for hit in search_results:
-#         # Usamos .get() por seguridad y buscamos la llave nueva
-#         cand_feat_path = hit.payload.get("feature_path") # ✅ SOLUCIONADO
-        
-#         if not cand_feat_path:
-#             continue
-#         try:
-#             cand_feats = torch.load(cand_feat_path, map_location=DEVICE, weights_only=False)
-#         except Exception:
-#             continue
-
-#         with torch.inference_mode():
-#             matches01 = matcher({"image0": query_feats, "image1": cand_feats})
-            
-#         matches01 = rbd(matches01)
-#         matches = matches01['matches'] 
-        
-#         if len(matches) < cfg['pipeline']['verification']['min_matches_lightglue']:
-#             continue
-            
-#         pts0 = query_feats['keypoints'][0][matches[..., 0]].cpu().numpy()
-#         pts1 = cand_feats['keypoints'][0][matches[..., 1]].cpu().numpy()
-        
-#         H, mask = cv2.findHomography(pts0, pts1, cv2.USAC_MAGSAC, cfg['pipeline']['verification']['ransac_threshold'])
-#         if mask is None:
-#             continue
-            
-#         inliers = mask.sum()
-        
-#         if inliers > max_inliers:
-#             max_inliers = inliers
-#             best_match = hit.payload.copy()
-#             best_match["inliers"] = int(inliers)
-#             best_match["fusion_score"] = float(hit.score)
-            
-#     if best_match:
-#         best_match["verified"] = True
-#         return best_match
-#     else:
-#         fallback_match = top_embedding_hit.payload.copy()
-#         fallback_match["fusion_score"] = float(top_embedding_hit.score)
-#         fallback_match["inliers"] = int(max_inliers) if max_inliers > 0 else 0 
-#         fallback_match["verified"] = False
-#         return fallback_match
-

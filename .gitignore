@@ -25,6 +25,7 @@ data/qdrant_storage/
 data/Catalogo/
 tmp_queries/
 *.csv
+*Catalogo*
 
 # =========================
 # Pesos de Modelos (PyTorch / HuggingFace)
