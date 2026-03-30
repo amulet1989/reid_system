@@ -8,7 +8,7 @@ system:
   csv_path: "/app/data/Catalogo_PM.csv"
 
 database:
-  collection_name: "catalogo_puerto_madero_en_p1"
+  collection_name: "catalogo_puerto_madero_en_p2"
 
 models:
   dinov2:
@@ -16,13 +16,13 @@ models:
     name: "dinov2_vitl14" #  "dinov2_vitb14" or "dinov2_vitl14" 
     image_size: 518
     vector_size: 1024 # DINOv2-B14 tiene 768 dimensiones, DINOv2-L14 tiene 1024
-    use_square_pad: false # Si es true, se mantendrá el aspect ratio original
+    use_square_pad: true # Si es true, se mantendrá el aspect ratio original
   qwen:
     id: "Qwen/Qwen3-VL-Embedding-2B"
     max_image_size: 4096
     vector_size: 2048
     # 🚀 Prompt táctico extraído del código
-    prompt: "Extract all text, brand names, and analyze the layout of this retail product packaging. Context: {metadata_text}"
+    prompt: "You are a retail product expert. Analyze this retail product packaging. Pay extreme attention to text differences: exact brand, specific flavor/variant, and the exact net weight/volume (e.g., grams, ml, oz). Context: {metadata_text}"
     context:
       reference: "Reference retail product packaging from official catalog."
       query: "Query retail product packaging from store shelf."
@@ -39,10 +39,25 @@ pipeline:
     top_k: 40
     # 🚀 NUEVO: Configuración del Re-Ranking K-Recíproco
     re_ranking:
-      enabled: true
+      enabled: false
       k1: 10              # Tamaño del vecindario para buscar reciprocidad
       lambda_weight: 0.3  # Peso entre Jaccard (0.7) y Distancia Original (0.3)
   verification:
     min_matches_lightglue: 10
     ransac_threshold: 4.0
     min_inliers_valid: 14
+
+video_processor:
+  model_name: "product_gondola_yolov26m_v01.pt"
+  tracker_config: "retail_tracker.yaml"
+  tracking:
+    max_unseen_frames: 60
+    min_trajectory_frames: 15
+  geometry:
+    edge_margin_pct: 0.05
+    focus_band_top_pct: 0.25
+    focus_band_bottom_pct: 0.75
+    min_height_pct: 0.05
+  filters:
+    min_box_width: 30
+    min_box_height: 30

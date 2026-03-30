@@ -80,6 +80,36 @@ services:
     depends_on:
       - api
     restart: unless-stopped
+
+  # 6. Procesador de Video (Slit-Scan Tracker Worker)
+  video_processor:
+    build:
+      context: ./video_processor
+    container_name: reid_video
+    networks:
+      - retail_net
+    volumes:
+      - ./models:/app/models          # 👈 Volumen para modelos dinámicos
+      - ./tmp_queries:/app/tmp_queries
+      - ./config.yml:/app/config.yml:ro
+    environment:
+      - API_URL=http://api:8000
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - YOLO_MODEL_URL=${YOLO_MODEL_URL}  # 🚀 NUEVO: URL del modelo YOLOv26m
+      - FORCE_DOWNLOAD_MODEL=${FORCE_DOWNLOAD_MODEL}    # 👈 Cámbialo a true si quieres sobreescribir el modelo
+    depends_on:
+      - redis
+      - api
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # 🚀 Comando: Arranca el worker escuchando EXCLUSIVAMENTE a video_queue
+    command: celery -A worker.celery_app worker --loglevel=info -Q video_queue --pool=solo
     
 networks:
   retail_net:

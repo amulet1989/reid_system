@@ -4,3 +4,4 @@ celery
 redis
 pyyaml
 pydantic
+python-multipart

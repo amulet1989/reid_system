@@ -2,7 +2,7 @@ import os
 import uuid
 import base64
 from fastapi.responses import FileResponse
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from celery import Celery
@@ -116,3 +116,24 @@ async def get_reference_image(path: str):
         
     # 3. Devolvemos la imagen
     return FileResponse(path)
+
+# 🚀 NUEVO ENDPOINT: Subida de Video y encolado en 'video_queue'
+@app.post("/api/v1/video/analyze", summary="Subir video para conteo de stock")
+async def analyze_video_endpoint(file: UploadFile = File(...)):
+    try:
+        unique_filename = f"{uuid.uuid4().hex}_{file.filename}"
+        video_path = os.path.join(TMP_DIR, unique_filename)
+
+        with open(video_path, "wb") as f:
+            f.write(await file.read())
+
+        # Especificamos que vaya a la cola 'video_queue'
+        task = celery_client.send_task(
+            "tasks.process_video",
+            args=[video_path],
+            queue="video_queue"
+        )
+
+        return {"message": "Video encolado para procesamiento", "task_id": task.id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -1,0 +1,8 @@
+celery
+redis
+ultralytics==8.4.30
+lapx>=0.5.5
+opencv-python-headless
+requests
+pyyaml
+numpy
