@@ -50,6 +50,10 @@ with st.sidebar:
 # --- CREACIÓN DE PESTAÑAS PARA SEPARAR FLUJOS ---
 tab_image, tab_video = st.tabs(["🖼️ Análisis por Imagen", "📹 Auditoría de Góndola (Video)"])
 
+# Inicializar memoria para las detecciones automáticas
+if "auto_bboxes" not in st.session_state:
+    st.session_state.auto_bboxes = []
+
 # ==========================================================
 # FLUJO 1: ANÁLISIS POR IMAGEN (Tu código original)
 # ==========================================================
@@ -65,15 +69,54 @@ with tab_image:
 
         if uploaded_file is not None:
             image = Image.open(uploaded_file).convert("RGB")
-            # --- PARCHE DE ROTACIÓN EXIF ---
-            image = ImageOps.exif_transpose(image) # ¡VITAL! Hornear rotación física
-            # -------------------------------
+            image = ImageOps.exif_transpose(image)
             img_width, img_height = image.size
             
-            tab_draw, tab_manual = st.tabs(["🖌️ Dibujar BBox", "⌨️ Ingreso Manual"])
+            # 🚀 NUEVO: 3 Pestañas de ingreso
+            tab_auto, tab_draw, tab_manual = st.tabs(["🤖 Auto-Detección", "🖌️ Dibujar BBox", "⌨️ Ingreso Manual"])
             
+            with tab_auto:
+                st.info("Utiliza el motor de Video (YOLO) para recortar automáticamente los productos.")
+                
+                if st.button("🪄 Extraer Cajas Automáticamente"):
+                    buffered = io.BytesIO()
+                    image.save(buffered, format="JPEG", quality=95)
+                    img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                    
+                    with st.spinner("YOLO analizando la imagen..."):
+                        try:
+                            res = requests.post(f"{API_URL}/detect_bboxes", json={"image_b64": img_b64})
+                            res.raise_for_status()
+                            task_id = res.json()["task_id"]
+                            
+                            while True:
+                                status_res = requests.get(f"{API_URL}/results/{task_id}").json()
+                                if status_res["status"] == "SUCCESS":
+                                    # Guardamos en memoria para no perderlas al repintar
+                                    st.session_state.auto_bboxes = status_res["result"].get("bboxes", [])
+                                    st.success(f"✅ ¡{len(st.session_state.auto_bboxes)} empaques detectados!")
+                                    break
+                                elif status_res["status"] == "FAILED":
+                                    st.error("Error en la detección.")
+                                    break
+                                time.sleep(0.5)
+                        except Exception as e:
+                            st.error(f"Error de conexión: {e}")
+                
+                # Si tenemos cajas en memoria, las dibujamos para que el usuario las audite
+                if st.session_state.auto_bboxes:
+                    img_preview = image.copy()
+                    draw = ImageDraw.Draw(img_preview)
+                    for box in st.session_state.auto_bboxes:
+                        draw.rectangle(box, outline="#00FF00", width=4)
+                    
+                    st.image(img_preview, caption="Auditoría Visual de YOLO", use_column_width=True)
+                    
+                    if st.checkbox("✅ Usar estas detecciones para la Re-Identificación", value=True):
+                        bboxes_to_send = st.session_state.auto_bboxes
+
             with tab_draw:
-                st.info("Dibuja uno o varios rectángulos sobre los productos. Si no dibujas nada, se analizará toda la imagen.")
+                st.info("Dibuja uno o varios rectángulos sobre los productos.")
                 canvas_display_width = 600
                 scale_factor = canvas_display_width / img_width
                 canvas_display_height = int(img_height * scale_factor)
@@ -98,6 +141,7 @@ with tab_image:
                             y1 = int(obj["top"] / scale_factor)
                             w = int((obj["width"] * obj["scaleX"]) / scale_factor)
                             h = int((obj["height"] * obj["scaleY"]) / scale_factor)
+                            # Si se dibuja a mano, esto sobrescribe a YOLO (Lógica de prioridad)
                             bboxes_to_send.append([x1, y1, x1 + w, y1 + h])
 
             with tab_manual:
@@ -108,13 +152,12 @@ with tab_image:
                 bbox_input = st.text_area("Coordenadas:", value=default_bbox, height=100)
                 
                 if st.button("Usar coordenadas manuales"):
-                    bboxes_to_send = []
+                    bboxes_to_send = [] # Sobrescribe todo
                     for line in bbox_input.split('\n'):
                         if line.strip():
                             try:
                                 coords = [int(x.strip()) for x in line.split(',')]
-                                if len(coords) == 4:
-                                    bboxes_to_send.append(coords)
+                                if len(coords) == 4: bboxes_to_send.append(coords)
                             except Exception:
                                 st.error(f"Línea inválida: {line}")
 

@@ -43,6 +43,10 @@ class PredictRequest(BaseModel):
         description="Lista de Bounding Boxes. Ejemplo: [[150, 200, 350, 450], [10, 20, 100, 150]]"
     )
 
+# --- Añadir debajo de tu clase PredictRequest ---
+class DetectRequest(BaseModel):
+    image_b64: str = Field(..., description="Imagen codificada en Base64 para detección YOLO")
+
 # 3. Endpoints REST
 @app.post("/api/v1/predict", summary="Enviar imagen y BBoxes para clasificación")
 async def predict_products(request: PredictRequest):
@@ -135,5 +139,28 @@ async def analyze_video_endpoint(file: UploadFile = File(...)):
         )
 
         return {"message": "Video encolado para procesamiento", "task_id": task.id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/api/v1/detect_bboxes", summary="Autodetectar BBoxes con YOLO")
+async def auto_detect_bboxes(request: DetectRequest):
+    """
+    Guarda la imagen y envía la orden al worker de video para que use su YOLO.
+    """
+    try:
+        unique_filename = f"yolo_{uuid.uuid4().hex}.jpg"
+        image_path = os.path.join(TMP_DIR, unique_filename)
+        
+        img_data = base64.b64decode(request.image_b64)
+        with open(image_path, "wb") as f:
+            f.write(img_data)
+            
+        # 🚀 La magia: Lo enviamos explícitamente a la 'video_queue'
+        task = celery_client.send_task(
+            "tasks.detect_bboxes",
+            args=[image_path],
+            queue="video_queue" 
+        )
+        return {"message": "Auto-detección encolada", "task_id": task.id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -4,11 +4,11 @@ system:
   device: "cuda"
   # Las rutas apuntan a /app/data porque así montaremos el volumen en Docker
   cache_dir: "/app/data/features_cache"
-  catalog_dir: "/app/data/Catalogo_PM"
-  csv_path: "/app/data/Catalogo_PM.csv"
+  catalog_dir: "/app/data/Catalogo"
+  csv_path: "/app/data/Catalogo.csv"
 
 database:
-  collection_name: "catalogo_puerto_madero_en_p2"
+  collection_name: "catalogo_oxxo_en_p2"
 
 models:
   dinov2:
@@ -61,3 +61,7 @@ video_processor:
   filters:
     min_box_width: 30
     min_box_height: 30
+  detector:
+    confidence_threshold: 0.2
+    iou_threshold: 0.7
+    imgsz: 640

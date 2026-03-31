@@ -8,6 +8,7 @@ import io
 import urllib.request
 from PIL import Image
 from celery import Celery
+from ultralytics import YOLO
 
 # --- 1. CONFIGURACIÓN Y DESCARGA DINÁMICA DE MODELO ---
 with open("/app/config.yml", "r") as f:
@@ -28,10 +29,15 @@ if FORCE_DOWNLOAD or (not os.path.exists(MODEL_PATH) and MODEL_URL):
     print("✅ Modelo descargado exitosamente.")
 
 # Inicializar YOLO de forma global para el worker
-from ultralytics import YOLO
+
 print(f"🧠 Cargando modelo YOLO: {MODEL_PATH}")
 yolo_model = YOLO(MODEL_PATH)
 tracker_path = f"/app/{vp_cfg['tracker_config']}"
+
+# Configuración de YOLO
+confidence_threshold = vp_cfg['detector']['confidence_threshold']
+iou_threshold = vp_cfg['detector']['iou_threshold']
+imgsz = vp_cfg['detector']['imgsz']
 
 # --- 2. CONFIGURACIÓN DE CELERY ---
 celery_app = Celery(
@@ -45,6 +51,36 @@ API_URL = os.getenv("API_URL", "http://api:8000")
 def calculate_sharpness(img_crop):
     gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+@celery_app.task(name="tasks.detect_bboxes")
+def detect_bboxes_task(image_path):
+    print(f"🔍 Ejecutando auto-detección YOLO en: {image_path}")
+    img = cv2.imread(image_path)
+    
+    if img is None:
+        return {"status": "FAILED", "error": "No se pudo leer la imagen"}
+
+    # Inferencia rápida con el modelo YOLO ya cargado
+    results = yolo_model(img, verbose=False, imgsz=imgsz, conf=confidence_threshold, iou=iou_threshold)
+    bboxes = []
+    
+    if results[0].boxes is not None:
+        boxes_data = results[0].boxes.xyxy.cpu().numpy().astype(int)
+        for box in boxes_data:
+            x1, y1, x2, y2 = box
+            
+            # Filtramos cajas que sean puro ruido (menores a 30x30 px)
+            if (x2 - x1) >= 30 and (y2 - y1) >= 30:
+                bboxes.append([int(x1), int(y1), int(x2), int(y2)])
+                
+    # Limpiamos el disco, ya sacamos lo que necesitábamos
+    try:
+        if os.path.exists(image_path):
+            os.remove(image_path)
+    except Exception as e:
+        pass
+        
+    return {"status": "SUCCESS", "bboxes": bboxes}
 
 @celery_app.task(name="tasks.process_video", bind=True)
 def process_video_task(self, video_path):
