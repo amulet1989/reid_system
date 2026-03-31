@@ -243,9 +243,13 @@ with tab_video:
                         inventario = resultado_video.get("stock_inventory", {})
                         
                         if inventario:
-                            # Convertimos el diccionario a DataFrame para una visualización ordenada
-                            df_stock = pd.DataFrame(list(inventario.items()), columns=["Producto (SKU)", "Cantidad"])
+                            # 'inventario' ahora es una lista de diccionarios con SKU, Producto, Verificado, Cantidad
+                            df_stock = pd.DataFrame(inventario)
+                            
+                            # Ordenamos para que los que tienen más cantidad salgan arriba
                             df_stock = df_stock.sort_values(by="Cantidad", ascending=False).reset_index(drop=True)
+                            
+                            # Pintamos la tabla
                             st.dataframe(df_stock)
                         else:
                             st.warning("⚠️ No se identificó con seguridad geométrica ningún producto de tu catálogo.")

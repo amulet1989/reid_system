@@ -73,7 +73,7 @@ def process_video_task(self, video_path):
         f_top, f_bot = int(h_frame * focus_top), int(h_frame * focus_bot)
         min_bbox_h = int(h_frame * min_h_pct)
         
-        results = yolo_model.track(frame, tracker=tracker_path, persist=True, verbose=False, conf=0.1, iou=0.7, imgsz=1280)
+        results = yolo_model.track(frame, tracker=tracker_path, persist=True, verbose=False, conf=0.1, iou=0.7, imgsz=1024)
         current_ids = set()
         
         if results[0].boxes is not None and results[0].boxes.id is not None:
@@ -162,27 +162,39 @@ def process_video_task(self, video_path):
                         detections = data["result"].get("detections", [])
                         if detections:
                             pred = detections[0].get("prediction", {})
-                            name = pred.get("name", "Desconocido")
                             
-                            # 🚀 NUEVO: Si no está verificado, le agregamos la etiqueta
-                            if not pred.get("verified", False):
-                                name = f"{name} (No verificado)"
+                            # Extraemos toda la data fundamental
+                            sku = pred.get("sku", "Sin SKU")
+                            name = pred.get("name", "Desconocido")
+                            verified = pred.get("verified", False)
+                            
+                            # Creamos una llave única combinando SKU y Verificación
+                            # Así separamos los "Takis verificados" de los "Takis dudosos"
+                            agg_key = f"{sku}_{verified}"
+                            
+                            if agg_key not in stock_count:
+                                stock_count[agg_key] = {
+                                    "SKU": sku,
+                                    "Producto": name,
+                                    "Verificado": "Sí" if verified else "No (Requiere revisión)",
+                                    "Cantidad": 0
+                                }
                                 
-                            stock_count[name] = stock_count.get(name, 0) + 1
+                            stock_count[agg_key]["Cantidad"] += 1
                         break
-                time.sleep(0.5) # Esperar medio segundo antes de consultar de nuevo
+                    elif data["status"] == "FAILED":
+                        print(f"Error en backend Re-ID: {data.get('error')}")
+                        break
+                time.sleep(0.5)
 
     finally:
-        # 🚀 CORRECCIÓN 2: Bloque finally para garantizar la limpieza del disco
         try: 
-            if os.path.exists(video_path):
-                os.remove(video_path)
-                print(f"🧹 Video temporal eliminado: {video_path}")
-        except Exception as e: 
-            print(f"⚠️ No se pudo borrar el video temporal: {e}")
+            if os.path.exists(video_path): os.remove(video_path)
+        except Exception as e: pass
     
     return {
         "status": "SUCCESS",
         "total_unique_items_detected": len(completed_tracks),
-        "stock_inventory": stock_count
+        # Convertimos el diccionario en una lista plana para que la API la devuelva limpia
+        "stock_inventory": list(stock_count.values()) 
     }
