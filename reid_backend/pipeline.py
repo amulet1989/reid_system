@@ -640,11 +640,49 @@ def query_online_multimodal_cached(img_crop_rgb):
         return best_match
         
     else:
-        # Fallback si nadie superó los inliers mínimos
-        fallback_match = top_embedding_hit.payload.copy()
-        fallback_match["fusion_score"] = float(top_embedding_hit.score)
+        # Fallback si nadie superó los inliers mínimos (La geometría falló)
+        # 1. Definimos un margen estrecho para el empate técnico (ej. 5% del mejor score)
+        top_score = search_results[0].score
+        margin = top_score * 0.05 
+        
+        # Filtramos los hits crudos de Qdrant que están en la zona de empate
+        fallback_candidates = [hit for hit in search_results if hit.score >= (top_score - margin)]
+        
+        best_fallback_hit = fallback_candidates[0]
+        best_shadow_score = -1.0
+        final_color_score = 0.0
+        
+        # 2. Re-ranking por color en las sombras
+        for hit in fallback_candidates:
+            # En search_results, los vectores están en el atributo .vector
+            cand_color = np.array(hit.vector.get("color_hsv", np.zeros(128)))
+            
+            if np.sum(vec_query_color) == 0 or np.sum(cand_color) == 0:
+                color_score = 0.0
+            else:
+                color_score = float(np.dot(vec_query_color, cand_color))
+                
+            shadow_score = hit.score
+            
+            # Premiamos o castigamos igual que en la verificación
+            if color_score >= 0.30:
+                shadow_score *= 1.2
+            elif color_score < 0.10:
+                shadow_score *= 0.5
+                
+            # Coronamos al nuevo ganador del fallback
+            if shadow_score > best_shadow_score:
+                best_shadow_score = shadow_score
+                best_fallback_hit = hit
+                final_color_score = color_score
+
+        # 3. Armamos el diccionario final de respuesta con el ganador del re-ranking
+        fallback_match = best_fallback_hit.payload.copy()
+        fallback_match["fusion_score"] = float(best_fallback_hit.score) # Mantenemos el score real intacto
+        fallback_match["color_score"] = float(final_color_score)
         fallback_match["inliers"] = int(max_inliers_found)
-        fallback_match["verified"] = False
+        fallback_match["verified"] = False # Siempre falso porque falló la geometría
+        
         return fallback_match
     
     

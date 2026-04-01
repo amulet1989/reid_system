@@ -62,6 +62,6 @@ video_processor:
     min_box_width: 30
     min_box_height: 30
   detector:
-    confidence_threshold: 0.2
+    confidence_threshold: 0.25
     iou_threshold: 0.7
-    imgsz: 640
+    imgsz: 1024
