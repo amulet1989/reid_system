@@ -126,7 +126,8 @@ def init_system():
             collection_name=COLLECTION_NAME,
             vectors_config={
                 "dinov2": VectorParams(size=cfg['models']['dinov2']['vector_size'], distance=Distance.COSINE),
-                "qwen_layout": VectorParams(size=cfg['models']['qwen']['vector_size'], distance=Distance.COSINE)
+                "qwen_layout": VectorParams(size=cfg['models']['qwen']['vector_size'], distance=Distance.COSINE),
+                "color_hsv": VectorParams(size=128, distance=Distance.COSINE) # 🚀 NUEVO
             }
         )
         print("📥 Colección nueva detectada. Ejecutando ingesta inicial del catálogo...")
@@ -169,7 +170,6 @@ def get_qwen_layout_embedding_from_array(img_rgb, metadata_text=""):
     
     emb = emb.float()
     return (emb / emb.norm(dim=-1, keepdim=True))[0].cpu().numpy()
-
 
 @torch.inference_mode()
 def extract_local_features_from_array(img_rgb):
@@ -228,6 +228,58 @@ def extract_local_features_from_array(img_rgb):
         
     return feats
 
+# Embeddings de color
+def get_hsv_color_embedding(img_rgb, is_query=False):
+    """
+    Calcula un Histograma HSV 3D invariante a la escala y blindado contra NaN.
+    """
+    img_work = img_rgb.copy()
+    
+    # 1. Recorte Central Geométrico (Solo para queries)
+    if is_query:
+        h, w = img_work.shape[:2]
+        m_y, m_x = int(h * 0.15), int(w * 0.15)
+        
+        # Verificamos que al recortar quede una imagen de al menos 10x10 px
+        if (h - 2*m_y) > 10 and (w - 2*m_x) > 10: 
+            img_work = img_work[m_y:h-m_y, m_x:w-m_x]
+    else:        # Para las imágenes de referencia, aplicamos un recorte más agresivo para enfocarnos en el centro del empaque
+        h, w = img_work.shape[:2]
+        m_y, m_x = int(h * 0.25), int(w * 0.25)
+        
+        if (h - 2*m_y) > 10 and (w - 2*m_x) > 10:
+            img_work = img_work[m_y:h-m_y, m_x:w-m_x]
+
+    img_hsv = cv2.cvtColor(img_work, cv2.COLOR_RGB2HSV)
+    
+    # 2. Máscara de Color Puro (Ignorar blancos, negros, grises y destellos)
+    # H: 0-180 (Todos los colores)
+    # S: 30-255 (Ignorar grises y el fondo blanco del catálogo)
+    # V: 30-240 (Ignorar sombras profundas y destellos del plástico)
+    lower_bound = np.array([0, 10, 15])
+    upper_bound = np.array([180, 255, 250])
+    mask = cv2.inRange(img_hsv, lower_bound, upper_bound)
+    
+    # 3. Histograma 3D
+    hist = cv2.calcHist(
+        [img_hsv], 
+        channels=[0, 1, 2], 
+        mask=mask, 
+        histSize=[8, 4, 4], 
+        ranges=[0, 180, 0, 256, 0, 256]
+    )
+    
+    # 4. 🚀 DEFENSA CONTRA EL VACÍO (Pixel Starvation)
+    # Si la suma del histograma es 0, no hay colores útiles. 
+    # Devolvemos un vector neutro para evitar errores NaN en el Coseno.
+    if hist.sum() == 0:
+        return np.zeros(128, dtype=np.float32)
+    
+    # 5. Normalización L2 (Invarianza de Escala)
+    cv2.normalize(hist, hist, norm_type=cv2.NORM_L2)
+    
+    return hist.flatten()
+
 # --- 4. FUNCIONES DE INGESTA (OFFLINE) ---
 def index_product_offline(sku, name, category, image_path, view_name="frente"):
     
@@ -255,12 +307,17 @@ def index_product_offline(sku, name, category, image_path, view_name="frente"):
         feat_path = os.path.join(CACHE_DIR, f"{sku}_{safe_img_name}_{feat_type}.pt") # Nombre dinámico
         torch.save(feats_cpu, feat_path)
         
+        vec_color = get_hsv_color_embedding(img_rgb) # 🚀 NUEVO: Embedding de color HSV
+
         point_id = str(uuid.uuid4())
         qdrant.upsert(
             collection_name=COLLECTION_NAME,
             points=[PointStruct(
                 id=point_id, 
-                vector={"dinov2": vec_visual.tolist(), "qwen_layout": vec_layout.tolist()}, 
+                vector={
+                    "dinov2": vec_visual.tolist(), 
+                    "qwen_layout": vec_layout.tolist(), 
+                    "color_hsv": vec_color.tolist()}, 
                 payload={
                     "sku": sku, 
                     "name": name, 
@@ -419,6 +476,7 @@ def query_online_multimodal_cached(img_crop_rgb):
     vec_visual = get_dinov2_embedding_from_array(img_crop_rgb)
     context = cfg['models']['qwen']['context']['query']
     vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text=context)
+    vec_query_color = get_hsv_color_embedding(img_crop_rgb, is_query=True) # 🚀 NUEVO: Embedding de color HSV
     # Consulta de empaque de producto minorista desde el estante de la tienda.
     # Query retail product packaging from store shelf.
     
@@ -488,17 +546,7 @@ def query_online_multimodal_cached(img_crop_rgb):
             continue
             
         inliers = mask.sum()
-        
-        # if inliers > max_inliers_found:
-        #     max_inliers_found = inliers
-        
-        # # 🚀 CAMBIO: En lugar de elegir al ganador de inmediato, guardamos TODOS los que sean válidos
-        # if inliers >= min_inliers_valid:
-        #     match_data = hit.payload.copy()
-        #     match_data["inliers"] = int(inliers)
-        #     match_data["fusion_score"] = float(hit.score)
-        #     valid_matches.append(match_data)
-        
+                
         # --- [PUNTO 1: CONFIDENCE RATIO] ---
         # Calculamos qué tan "limpio" es el match
         conf_ratio = inliers / num_matches if num_matches > 0 else 0
@@ -512,6 +560,7 @@ def query_online_multimodal_cached(img_crop_rgb):
 
         if is_geometric_valid:
             match_data = hit.payload.copy()
+            match_data["color_hsv"] = hit.vector["color_hsv"] # Rescatamos el vector de color de Qdrant y lo guardamos en nuestro diccionario
             match_data["inliers"] = int(inliers)  # 🔥 El cast a int() de Python es vital aquí
             match_data["conf_ratio"] = float(conf_ratio) # 🔥 Cast a float nativo por seguridad
             match_data["fusion_score"] = float(hit.score)
@@ -532,21 +581,36 @@ def query_online_multimodal_cached(img_crop_rgb):
         # 3. Filtramos los candidatos que están dentro de este margen de empate técnico
         tied_candidates = [m for m in valid_matches if m["inliers"] >= (top_inliers - margin)]
         
-        # 4. De los empatados geométricamente, DINOv2 y Qwen eligen al ganador por color/texto
-        best_match = max(tied_candidates, key=lambda x: x["fusion_score"])
-    
-    # Respuesta Final
-    # if best_match:
-    #     # 🚀 REGLA DE VETO MULTIMODAL: 
-    #     # Si la geometría dice "Sí", pero DINO/Qwen dicen "Definitivamente No" (Score < 0.2)
-    #     if best_match["fusion_score"] < 0.2: # 0.2
-    #         best_match["verified"] = False
-    #     else:
-    #         best_match["verified"] = True
+        # # 4. De los empatados geométricamente, DINOv2 y Qwen eligen al ganador por color/texto
+        # best_match = max(tied_candidates, key=lambda x: x["fusion_score"])
+        
+        # 🚀 REGLA DEL COLOR: Desempate Fantasma (Sin afectar la verificación)
+        for cand in tied_candidates:
+            # Recuperamos el vector de Qdrant (Asegúrate de haberlo guardado antes en el dict)
+            cand_color = np.array(cand.get("color_hsv", np.zeros(128)))
             
-    #     return best_match
-
-    # ... (después de elegir el best_match)
+            # 1. DEFENSA CONTRA VECTORES VACÍOS
+            if np.sum(vec_query_color) == 0 or np.sum(cand_color) == 0:
+                cand["color_score"] = 0.0
+            else:
+                cand["color_score"] = float(np.dot(vec_query_color, cand_color))
+            
+            # 2. CREACIÓN DEL "SHADOW SCORE" PARA EL DESEMPATE
+            # Partimos del score original, pero en una variable paralela
+            cand["selection_score"] = cand["fusion_score"]
+            
+            # Si el color coincide moderadamente bien (luces similares), le damos un bonus para ganar
+            if cand["color_score"] >= 0.30:
+                cand["selection_score"] *= 1.2
+                
+            # Si el color es radicalmente opuesto (Gemelo Malvado evidente), lo hundimos
+            elif cand["color_score"] < 0.10:
+                cand["selection_score"] *= 0.5
+                
+        # 🧠 EL TIE-BREAKER DEFINITIVO
+        # Elegimos al ganador usando nuestra variable fantasma alterada por el color...
+        best_match = max(tied_candidates, key=lambda x: x["selection_score"])
+   
         
         # 1. Extraemos los valores clave del ganador
         final_inliers = best_match["inliers"]

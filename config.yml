@@ -8,7 +8,7 @@ system:
   csv_path: "/app/data/Catalogo.csv"
 
 database:
-  collection_name: "catalogo_oxxo_en_p2"
+  collection_name: "catalogo_oxxo_en_color"
 
 models:
   dinov2:
