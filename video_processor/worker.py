@@ -52,6 +52,36 @@ def calculate_sharpness(img_crop):
     gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
+# @celery_app.task(name="tasks.detect_bboxes")
+# def detect_bboxes_task(image_path):
+#     print(f"🔍 Ejecutando auto-detección YOLO en: {image_path}")
+#     img = cv2.imread(image_path)
+    
+#     if img is None:
+#         return {"status": "FAILED", "error": "No se pudo leer la imagen"}
+
+#     # Inferencia rápida con el modelo YOLO ya cargado
+#     results = yolo_model(img, verbose=False, imgsz=imgsz, conf=confidence_threshold, iou=iou_threshold, device='cuda')
+#     bboxes = []
+    
+#     if results[0].boxes is not None:
+#         boxes_data = results[0].boxes.xyxy.cpu().numpy().astype(int)
+#         for box in boxes_data:
+#             x1, y1, x2, y2 = box
+            
+#             # Filtramos cajas que sean puro ruido (menores a 30x30 px)
+#             if (x2 - x1) >= 30 and (y2 - y1) >= 30:
+#                 bboxes.append([int(x1), int(y1), int(x2), int(y2)])
+                
+#     # Limpiamos el disco, ya sacamos lo que necesitábamos
+#     try:
+#         if os.path.exists(image_path):
+#             os.remove(image_path)
+#     except Exception as e:
+#         pass
+        
+#     return {"status": "SUCCESS", "bboxes": bboxes}
+
 @celery_app.task(name="tasks.detect_bboxes")
 def detect_bboxes_task(image_path):
     print(f"🔍 Ejecutando auto-detección YOLO en: {image_path}")
@@ -60,8 +90,16 @@ def detect_bboxes_task(image_path):
     if img is None:
         return {"status": "FAILED", "error": "No se pudo leer la imagen"}
 
+    # 🚀 NUEVO: Extraemos dimensiones para la exclusión de bordes
+    h_img, w_img = img.shape[:2]
+    
+    # Usamos el 5% como margen (puedes enlazarlo a vp_cfg['geometry']['edge_margin_pct'] si prefieres)
+    margin_pct = vp_cfg['geometry']['edge_margin_pct']
+    margin_x = int(w_img * margin_pct)
+    margin_y = int(h_img * margin_pct)
+
     # Inferencia rápida con el modelo YOLO ya cargado
-    results = yolo_model(img, verbose=False, imgsz=imgsz, conf=confidence_threshold, iou=iou_threshold)
+    results = yolo_model(img, verbose=False, imgsz=imgsz, conf=confidence_threshold, iou=iou_threshold, device='cuda')
     bboxes = []
     
     if results[0].boxes is not None:
@@ -69,6 +107,14 @@ def detect_bboxes_task(image_path):
         for box in boxes_data:
             x1, y1, x2, y2 = box
             
+            # 🚀 NUEVO: Evaluación de márgenes (¿Toca o cruza la zona de exclusión?)
+            is_near_edge = (x1 <= margin_x) or (y1 <= margin_y) or \
+                           (x2 >= w_img - margin_x) or (y2 >= h_img - margin_y)
+            
+            # Si está en el borde, lo descartamos inmediatamente
+            if is_near_edge:
+                continue
+                
             # Filtramos cajas que sean puro ruido (menores a 30x30 px)
             if (x2 - x1) >= 30 and (y2 - y1) >= 30:
                 bboxes.append([int(x1), int(y1), int(x2), int(y2)])

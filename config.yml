@@ -4,11 +4,11 @@ system:
   device: "cuda"
   # Las rutas apuntan a /app/data porque así montaremos el volumen en Docker
   cache_dir: "/app/data/features_cache"
-  catalog_dir: "/app/data/Catalogo"
-  csv_path: "/app/data/Catalogo.csv"
+  catalog_dir: "/app/data/Catalogo_PM"
+  csv_path: "/app/data/Catalogo_PM.csv"
 
 database:
-  collection_name: "catalogo_oxxo_en_color"
+  collection_name: "catalogo_pm_en_color"
 
 models:
   dinov2:
@@ -54,7 +54,7 @@ video_processor:
     max_unseen_frames: 60
     min_trajectory_frames: 15
   geometry:
-    edge_margin_pct: 0.05
+    edge_margin_pct: 0.01
     focus_band_top_pct: 0.25
     focus_band_bottom_pct: 0.75
     min_height_pct: 0.05
@@ -62,6 +62,6 @@ video_processor:
     min_box_width: 30
     min_box_height: 30
   detector:
-    confidence_threshold: 0.25
+    confidence_threshold: 0.35
     iou_threshold: 0.7
     imgsz: 1024

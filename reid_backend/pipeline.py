@@ -600,12 +600,12 @@ def query_online_multimodal_cached(img_crop_rgb):
             cand["selection_score"] = cand["fusion_score"]
             
             # Si el color coincide moderadamente bien (luces similares), le damos un bonus para ganar
-            if cand["color_score"] >= 0.30:
+            if cand["color_score"] >= 0.45: # 0.30 0.40
                 cand["selection_score"] *= 1.2
                 
             # Si el color es radicalmente opuesto (Gemelo Malvado evidente), lo hundimos
-            elif cand["color_score"] < 0.10:
-                cand["selection_score"] *= 0.5
+            elif cand["color_score"] < 0.25: # 0.10 0.25
+                cand["selection_score"] *= 0.1 # 0.5 0.1
                 
         # 🧠 EL TIE-BREAKER DEFINITIVO
         # Elegimos al ganador usando nuestra variable fantasma alterada por el color...
@@ -665,10 +665,10 @@ def query_online_multimodal_cached(img_crop_rgb):
             shadow_score = hit.score
             
             # Premiamos o castigamos igual que en la verificación
-            if color_score >= 0.30:
+            if color_score >= 0.45: # 0.30 0.40
                 shadow_score *= 1.2
-            elif color_score < 0.10:
-                shadow_score *= 0.5
+            elif color_score < 0.25: # 0.10 0.20
+                shadow_score *= 0.1
                 
             # Coronamos al nuevo ganador del fallback
             if shadow_score > best_shadow_score:
