@@ -8,7 +8,7 @@ system:
   csv_path: "/app/data/Catalogo_PM.csv"
 
 database:
-  collection_name: "catalogo_pm_en_color"
+  collection_name: "catalogo_pm_en_color_p3"
 
 models:
   dinov2:
@@ -22,7 +22,7 @@ models:
     max_image_size: 4096
     vector_size: 2048
     # 🚀 Prompt táctico extraído del código
-    prompt: "You are a retail product expert. Analyze this retail product packaging. Pay extreme attention to text differences: exact brand, specific flavor/variant, and the exact net weight/volume (e.g., grams, ml, oz). Context: {metadata_text}"
+    prompt: "Generate a discriminative embedding for this Mexican retail SKU. Prioritize: 1) Brand name and logo, 2) Specific flavor or aroma variant, 3) Exact net content and unit of measure, 4) Presence of nutritional warning labels (octagons), 5) Distinctive graphic elements on the packaging, and 6) Predominant color. Ignore the shelf context and lighting variations. Context: {metadata_text}"
     context:
       reference: "Reference retail product packaging from official catalog."
       query: "Query retail product packaging from store shelf."
@@ -62,6 +62,6 @@ video_processor:
     min_box_width: 30
     min_box_height: 30
   detector:
-    confidence_threshold: 0.35
+    confidence_threshold: 0.25
     iou_threshold: 0.7
-    imgsz: 1024
+    imgsz: 640
