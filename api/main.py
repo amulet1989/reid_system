@@ -43,7 +43,6 @@ class PredictRequest(BaseModel):
         description="Lista de Bounding Boxes. Ejemplo: [[150, 200, 350, 450], [10, 20, 100, 150]]"
     )
 
-# --- Añadir debajo de tu clase PredictRequest ---
 class DetectRequest(BaseModel):
     image_b64: str = Field(..., description="Imagen codificada en Base64 para detección YOLO")
 

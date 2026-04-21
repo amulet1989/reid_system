@@ -6,5 +6,5 @@ opencv-python-headless
 requests
 pyyaml
 numpy
-hdbscan 
+# hdbscan 
 scikit-learn

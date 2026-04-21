@@ -45,17 +45,17 @@ with st.sidebar:
                     status_placeholder.error(f"❌ Error en la sincronización: {res_status.get('error')}")
                     break
                 
-                time.sleep(1) # Consultamos cada 1 segundo para no saturar
+                time.sleep(1)
 
 # --- CREACIÓN DE PESTAÑAS PARA SEPARAR FLUJOS ---
 tab_image, tab_video = st.tabs(["🖼️ Análisis por Imagen", "📹 Auditoría de Góndola (Video)"])
 
 # Inicializar memoria para las detecciones automáticas
-if "auto_bboxes" not in st.session_state:
-    st.session_state.auto_bboxes = []
+if "auto_detections" not in st.session_state:
+    st.session_state.auto_detections = []
 
 # ==========================================================
-# FLUJO 1: ANÁLISIS POR IMAGEN (Tu código original)
+# FLUJO 1: ANÁLISIS POR IMAGEN
 # ==========================================================
 with tab_image:
     col1, col2 = st.columns([1.2, 1])
@@ -72,18 +72,26 @@ with tab_image:
             image = ImageOps.exif_transpose(image)
             img_width, img_height = image.size
             
-            # 🚀 NUEVO: 3 Pestañas de ingreso
-            tab_auto, tab_draw, tab_manual = st.tabs(["🤖 Auto-Detección", "🖌️ Dibujar BBox", "⌨️ Ingreso Manual"])
+            tab_auto, tab_draw, tab_manual = st.tabs(["🤖 Auto-Análisis Completo", "🖌️ Dibujar BBox", "⌨️ Ingreso Manual"])
             
-            with tab_auto:
-                st.info("Utiliza el motor de Video (YOLO) para recortar automáticamente los productos.")
+            # with tab_auto:
+                # 🚀 SOLUCIÓN: Usamos un selector en lugar de pestañas para evitar el bug del canvas
+            metodo_input = st.radio(
+                "Selecciona el método de entrada:",
+                ["🤖 Auto-Análisis Completo", "🖌️ Dibujar BBox", "⌨️ Ingreso Manual"],
+                horizontal=True
+            )
+            
+            # --- SECCIÓN 1: AUTO-ANÁLISIS ---
+            if metodo_input == "🤖 Auto-Análisis Completo":
+                st.info("El motor Híbrido detectará, re-identificará y resolverá conflictos en un solo paso.")
                 
-                if st.button("🪄 Extraer Cajas Automáticamente"):
+                if st.button("🪄 Ejecutar Pipeline Automático", type="primary"):
                     buffered = io.BytesIO()
                     image.save(buffered, format="JPEG", quality=95)
                     img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
                     
-                    with st.spinner("YOLO analizando la imagen..."):
+                    with st.spinner("Motor Híbrido analizando la imagen..."):
                         try:
                             res = requests.post(f"{API_URL}/detect_bboxes", json={"image_b64": img_b64})
                             res.raise_for_status()
@@ -92,9 +100,8 @@ with tab_image:
                             while True:
                                 status_res = requests.get(f"{API_URL}/results/{task_id}").json()
                                 if status_res["status"] == "SUCCESS":
-                                    # Guardamos en memoria para no perderlas al repintar
-                                    st.session_state.auto_bboxes = status_res["result"].get("bboxes", [])
-                                    st.success(f"✅ ¡{len(st.session_state.auto_bboxes)} empaques detectados!")
+                                    st.session_state.auto_detections = status_res["result"].get("detections", [])
+                                    st.success(f"✅ ¡{len(st.session_state.auto_detections)} productos analizados!")
                                     break
                                 elif status_res["status"] == "FAILED":
                                     st.error("Error en la detección.")
@@ -103,20 +110,28 @@ with tab_image:
                         except Exception as e:
                             st.error(f"Error de conexión: {e}")
                 
-                # Si tenemos cajas en memoria, las dibujamos para que el usuario las audite
-                if st.session_state.auto_bboxes:
+                if st.session_state.auto_detections:
                     img_preview = image.copy()
                     draw = ImageDraw.Draw(img_preview)
-                    for box in st.session_state.auto_bboxes:
-                        draw.rectangle(box, outline="#00FF00", width=4)
                     
-                    st.image(img_preview, caption="Auditoría Visual de YOLO", use_column_width=True)
+                    for det in st.session_state.auto_detections:
+                        box = det["bbox"]
+                        color = "#00FF00" if det["verified"] else "#FFA500"
+                        label = det["sku"] if det["verified"] else "DUDOSO"
+                        
+                        draw.rectangle(box, outline=color, width=4)
+                        draw.text((box[0], max(0, box[1]-15)), label, fill=color)
                     
-                    if st.checkbox("✅ Usar estas detecciones para la Re-Identificación", value=True):
-                        bboxes_to_send = st.session_state.auto_bboxes
+                    st.image(img_preview, caption="Auditoría Visual Híbrida", use_column_width=True)
+                    
+                    st.markdown("### 📊 Reporte de la Escena")
+                    df_auto = pd.DataFrame(st.session_state.auto_detections)
+                    if not df_auto.empty:
+                        st.dataframe(df_auto[["sku", "name", "verified"]], use_container_width=True)
 
-            with tab_draw:
-                st.info("Dibuja uno o varios rectángulos sobre los productos.")
+            # --- SECCIÓN 2: DIBUJAR MANUALMENTE ---
+            elif metodo_input == "🖌️ Dibujar BBox":
+                st.info("Dibuja recortes para forzar una consulta manual (Bypassea el motor híbrido).")
                 canvas_display_width = 600
                 scale_factor = canvas_display_width / img_width
                 canvas_display_height = int(img_height * scale_factor)
@@ -141,10 +156,10 @@ with tab_image:
                             y1 = int(obj["top"] / scale_factor)
                             w = int((obj["width"] * obj["scaleX"]) / scale_factor)
                             h = int((obj["height"] * obj["scaleY"]) / scale_factor)
-                            # Si se dibuja a mano, esto sobrescribe a YOLO (Lógica de prioridad)
                             bboxes_to_send.append([x1, y1, x1 + w, y1 + h])
 
-            with tab_manual:
+            # --- SECCIÓN 3: INGRESO POR TEXTO ---
+            elif metodo_input == "⌨️ Ingreso Manual":
                 st.image(image, caption="Imagen original", use_column_width=True)
                 st.info("Ingresa un BBox por línea con el formato: x1, y1, x2, y2")
                 
@@ -152,7 +167,7 @@ with tab_image:
                 bbox_input = st.text_area("Coordenadas:", value=default_bbox, height=100)
                 
                 if st.button("Usar coordenadas manuales"):
-                    bboxes_to_send = [] # Sobrescribe todo
+                    bboxes_to_send = []
                     for line in bbox_input.split('\n'):
                         if line.strip():
                             try:
@@ -161,15 +176,14 @@ with tab_image:
                             except Exception:
                                 st.error(f"Línea inválida: {line}")
 
-            if not bboxes_to_send:
-                bboxes_to_send = [[0, 0, img_width, img_height]]
-
     with col2:
-        st.header("2. Resultados")
-        if uploaded_file is not None:
+        st.header("2. Consultas Manuales")
+        st.info("Usa esta sección solo si dibujaste o ingresaste coordenadas manualmente.")
+        
+        if uploaded_file is not None and bboxes_to_send:
             st.write(f"📦 **Recortes a procesar:** {len(bboxes_to_send)}")
             
-            if st.button("🔍 Identificar Productos", type="primary"):
+            if st.button("🔍 Identificar Recortes Manuales"):
                 buffered = io.BytesIO()
                 image.save(buffered, format="JPEG", quality=95)
                 img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
@@ -194,7 +208,7 @@ with tab_image:
                     if estado == "PENDING":
                         status_placeholder.info("⏳ En cola de espera...")
                     elif estado == "PROCESSING":
-                        status_placeholder.warning("⚙️ Procesando recortes en RTX 3080 Ti...")
+                        status_placeholder.warning("⚙️ Procesando recortes...")
                     elif estado == "SUCCESS":
                         status_placeholder.empty()
                         st.success("✅ Procesamiento completado")
@@ -207,7 +221,7 @@ with tab_image:
                             img_path = det["prediction"].get("image_path")
                             if img_path:
                                 with st.expander("🔬 Ver Validación Visual del Recorte"):
-                                    with st.spinner("Generando visualización del recorte..."):
+                                    with st.spinner("Generando visualización..."):
                                         try:
                                             res_img = requests.get(f"{API_URL}/image", params={"path": img_path})
                                             if res_img.status_code == 200:
@@ -215,16 +229,15 @@ with tab_image:
                                                 x1, y1, x2, y2 = det['bbox_coords']
                                                 img_crop = image.crop((x1, y1, x2, y2))
 
-                                                st.markdown("**Izquierda:** Tu recorte exacto. **Derecha:** Referencia oficial.")
                                                 col_c, col_r = st.columns(2)
                                                 with col_c:
                                                     st.image(img_crop, caption="Crop enviado a la IA", use_column_width=True)
                                                 with col_r:
-                                                    st.image(ref_image_pil, caption="Referencia del Catálogo", use_column_width=True)
+                                                    st.image(ref_image_pil, caption="Referencia Oficial", use_column_width=True)
                                             else:
-                                                st.error(f"Error {res_img.status_code}: Imagen de catálogo no encontrada.")
+                                                st.error("Imagen de catálogo no encontrada.")
                                         except Exception as e:
-                                            st.error(f"No se pudo generar la visualización: {e}")
+                                            st.error(f"Error: {e}")
                         break
                     elif estado == "FAILED":
                         status_placeholder.error(f"❌ Error: {res.get('error')}")
@@ -234,7 +247,7 @@ with tab_image:
 
 
 # ==========================================================
-# FLUJO 2: AUDITORÍA POR VIDEO (NUEVO)
+# FLUJO 2: AUDITORÍA POR VIDEO
 # ==========================================================
 with tab_video:
     st.header("Auditoría de Góndolas (Patrón Serpiente)")
@@ -248,7 +261,6 @@ with tab_video:
         if st.button("🚀 Iniciar Conteo de Stock", type="primary"):
             with st.spinner("Subiendo video al servidor..."):
                 try:
-                    # Enviar video al endpoint de la API
                     files = {"file": (uploaded_video.name, uploaded_video.getvalue(), uploaded_video.type)}
                     response = requests.post(f"{API_URL}/video/analyze", files=files)
                     response.raise_for_status()
@@ -259,7 +271,6 @@ with tab_video:
                     st.error(f"Error al subir el video: {e}")
                     st.stop()
 
-            # Polling del procesamiento de video
             status_placeholder_vid = st.empty()
             while True:
                 try:
@@ -277,23 +288,16 @@ with tab_video:
                         
                         resultado_video = res_vid["result"]
                         
-                        # Mostrar métrica general
                         total_items = resultado_video.get("total_unique_items_detected", 0)
                         st.metric("Total de Productos Detectados", total_items)
                         
-                        # Renderizar Inventario Consolidado
                         st.subheader("📊 Reporte de Stock Real")
                         inventario = resultado_video.get("stock_inventory", {})
                         
                         if inventario:
-                            # 'inventario' ahora es una lista de diccionarios con SKU, Producto, Verificado, Cantidad
                             df_stock = pd.DataFrame(inventario)
-                            
-                            # Ordenamos para que los que tienen más cantidad salgan arriba
                             df_stock = df_stock.sort_values(by="Cantidad", ascending=False).reset_index(drop=True)
-                            
-                            # Pintamos la tabla
-                            st.dataframe(df_stock)
+                            st.dataframe(df_stock, use_container_width=True)
                         else:
                             st.warning("⚠️ No se identificó con seguridad geométrica ningún producto de tu catálogo.")
                         
@@ -302,7 +306,7 @@ with tab_video:
                         status_placeholder_vid.error(f"❌ Fallo en el análisis: {res_vid.get('error')}")
                         break
                         
-                    time.sleep(2) # Polling cada 2 segundos (el video tarda más que una imagen)
+                    time.sleep(2)
                     
                 except Exception as e:
                     status_placeholder_vid.error(f"Error consultando resultados: {e}")

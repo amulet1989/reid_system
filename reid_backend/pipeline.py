@@ -492,8 +492,16 @@ def query_online_multimodal_cached(img_crop_rgb):
         with_vectors=True 
     ).points
     
+    # if not search_results:
+    #     return None
     if not search_results:
-        return None
+        # 🚀 NUEVO: En lugar de 'return None', devolvemos un diccionario base con el embedding
+        return {
+            "sku": "N/A",
+            "name": "Desconocido",
+            "verified": False,
+            "embedding": vec_layout.tolist() # El tensor de DINOv2 convertido a lista
+        }
     
     # 🚀 NUEVO: Bloque de Re-Ranking K-Recíproco Topológico
     if cfg['pipeline']['retrieval'].get('re_ranking', {}).get('enabled', False):
@@ -636,7 +644,9 @@ def query_online_multimodal_cached(img_crop_rgb):
             # INLIERS BAJOS (< 14)
             # Nunca lo verificamos, es puro ruido estadístico.
             best_match["verified"] = False
-            
+        
+        # 🚀 NUEVO: Adjuntamos el embedding semántico profundo al ganador
+        best_match["embedding"] = vec_layout.tolist()    
         return best_match
         
     else:
@@ -682,6 +692,9 @@ def query_online_multimodal_cached(img_crop_rgb):
         fallback_match["color_score"] = float(final_color_score)
         fallback_match["inliers"] = int(max_inliers_found)
         fallback_match["verified"] = False # Siempre falso porque falló la geometría
+
+        # 🚀 NUEVO: Adjuntamos el embedding para que el worker de video pueda usarlo
+        fallback_match["embedding"] = vec_layout.tolist()
         
         return fallback_match
     
