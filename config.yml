@@ -37,6 +37,8 @@ models:
 pipeline:
   retrieval:
     top_k: 40
+    # 🚀 NUEVO: Modo de búsqueda. Opciones: "fusion", "dinov2_only", "qwen_only"
+    search_mode: "qwen_only"
     # 🚀 NUEVO: Configuración del Re-Ranking K-Recíproco
     re_ranking:
       enabled: false
@@ -54,7 +56,7 @@ video_processor:
     max_unseen_frames: 120
     min_trajectory_frames: 40
   geometry:
-    edge_margin_pct: 0.05
+    edge_margin_pct: 0.01
     focus_band_top_pct: 0.25
     focus_band_bottom_pct: 0.75
     min_height_pct: 0.05
@@ -68,4 +70,4 @@ video_processor:
   clustering:
     dbscan_eps: 15.0
     min_samples: 2
-    deep_similarity_threshold: 0.50
+    deep_similarity_threshold: 0.75

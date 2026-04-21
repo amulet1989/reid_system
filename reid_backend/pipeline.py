@@ -395,11 +395,88 @@ def crop_bbox(image_rgb, bbox):
     x2, y2 = min(w, x2), min(h, y2)
     return image_rgb[y1:y2, x1:x2]
 
-# Reranking local k-reciprocal basado en DINOv2 + Qwen-VL, pero solo entre los candidatos top-K recuperados por Qdrant.
+# # Reranking local k-reciprocal basado en DINOv2 + Qwen-VL, pero solo entre los candidatos top-K recuperados por Qdrant.
+# def local_k_reciprocal_re_ranking(vec_visual, vec_layout, search_results):
+#     """
+#     Aplica el algoritmo k-reciprocal re-ranking (Zhong et al.) de forma ultra-ligera
+#     restringido al sub-espacio topológico de los candidatos recuperados por Qdrant.
+#     """
+#     K = len(search_results)
+#     if K == 0:
+#         return search_results
+        
+#     cfg_rr = cfg['pipeline']['retrieval']['re_ranking']
+#     k1 = min(cfg_rr['k1'], K)
+#     lambda_weight = cfg_rr['lambda_weight']
+    
+#     dim_dino = len(vec_visual)
+#     dim_qwen = len(vec_layout)
+    
+#     # 1. Construir matrices locales: [Query, Cand_1, Cand_2, ..., Cand_K]
+#     all_dino = np.zeros((K + 1, dim_dino))
+#     all_qwen = np.zeros((K + 1, dim_qwen))
+    
+#     all_dino[0] = vec_visual
+#     all_qwen[0] = vec_layout
+    
+#     for i, hit in enumerate(search_results):
+#         vecs = hit.vector
+#         all_dino[i+1] = vecs["dinov2"]
+#         all_qwen[i+1] = vecs["qwen_layout"]
+        
+#     # Normalización L2 segura
+#     all_dino = all_dino / np.linalg.norm(all_dino, axis=1, keepdims=True)
+#     all_qwen = all_qwen / np.linalg.norm(all_qwen, axis=1, keepdims=True)
+    
+#     # 2. Calcular Distancia Original (Promedio de Cosine Distances multimodales)
+#     sim_dino = np.dot(all_dino, all_dino.T)
+#     sim_qwen = np.dot(all_qwen, all_qwen.T)
+#     dist_matrix = 1.0 - ((sim_dino + sim_qwen) / 2.0) # Distancia original d(p, g_i)
+    
+#     # 3. Encontrar vecindarios recíprocos y aplicar pesos Gaussianos
+#     initial_rank = np.argsort(dist_matrix, axis=1) 
+#     V = np.zeros((K + 1, K + 1))
+    
+#     for i in range(K + 1):
+#         forward_k_neighbors = initial_rank[i, :k1 + 1] 
+#         for j in forward_k_neighbors:
+#             backward_k_neighbors = initial_rank[j, :k1 + 1]
+#             if i in backward_k_neighbors:
+#                 # Es recíproco. Aplicar Eq. 7 del paper
+#                 V[i, j] = np.exp(-dist_matrix[i, j])
+                
+#     # 4. Calcular Distancia de Jaccard y Distancia Final (Eq. 10 y Eq. 12)
+#     V_probe = V[0] 
+#     re_ranked_hits = []
+    
+#     for i in range(1, K + 1):
+#         V_candidate = V[i]
+        
+#         intersection = np.sum(np.minimum(V_probe, V_candidate))
+#         union = np.sum(np.maximum(V_probe, V_candidate))
+        
+#         jaccard_dist = 1.0 if union == 0 else 1.0 - (intersection / union)
+        
+#         # Eq. 12 del paper: Combinación ponderada
+#         final_dist = (1 - lambda_weight) * jaccard_dist + lambda_weight * dist_matrix[0, i]
+        
+#         # Convertir distancia a Score (mayor es mejor) para la lógica downstream
+#         final_score = 1.0 - final_dist
+        
+#         # Actualizamos el score del candidato
+#         hit = search_results[i-1]
+#         hit.score = float(final_score)
+#         re_ranked_hits.append(hit)
+        
+#     # Ordenar por el nuevo score k-recíproco
+#     re_ranked_hits.sort(key=lambda x: x.score, reverse=True)
+#     return re_ranked_hits
+
+# Reranking local k-reciprocal adaptado para soportar Single-Model o Fusion
 def local_k_reciprocal_re_ranking(vec_visual, vec_layout, search_results):
     """
-    Aplica el algoritmo k-reciprocal re-ranking (Zhong et al.) de forma ultra-ligera
-    restringido al sub-espacio topológico de los candidatos recuperados por Qdrant.
+    Aplica el algoritmo k-reciprocal re-ranking.
+    Soporta dinámicamente si falta alguno de los embeddings (modos single-model).
     """
     K = len(search_results)
     if K == 0:
@@ -409,31 +486,39 @@ def local_k_reciprocal_re_ranking(vec_visual, vec_layout, search_results):
     k1 = min(cfg_rr['k1'], K)
     lambda_weight = cfg_rr['lambda_weight']
     
-    dim_dino = len(vec_visual)
-    dim_qwen = len(vec_layout)
+    sim_dino = 0
+    sim_qwen = 0
+    divisor = 0
     
-    # 1. Construir matrices locales: [Query, Cand_1, Cand_2, ..., Cand_K]
-    all_dino = np.zeros((K + 1, dim_dino))
-    all_qwen = np.zeros((K + 1, dim_qwen))
-    
-    all_dino[0] = vec_visual
-    all_qwen[0] = vec_layout
-    
-    for i, hit in enumerate(search_results):
-        vecs = hit.vector
-        all_dino[i+1] = vecs["dinov2"]
-        all_qwen[i+1] = vecs["qwen_layout"]
+    # 1. Matriz DINOv2 (Solo si existe)
+    if vec_visual is not None:
+        dim_dino = len(vec_visual)
+        all_dino = np.zeros((K + 1, dim_dino))
+        all_dino[0] = vec_visual
+        for i, hit in enumerate(search_results):
+            all_dino[i+1] = hit.vector["dinov2"]
+        all_dino = all_dino / np.linalg.norm(all_dino, axis=1, keepdims=True)
+        sim_dino = np.dot(all_dino, all_dino.T)
+        divisor += 1
+
+    # 2. Matriz Qwen (Solo si existe)
+    if vec_layout is not None:
+        dim_qwen = len(vec_layout)
+        all_qwen = np.zeros((K + 1, dim_qwen))
+        all_qwen[0] = vec_layout
+        for i, hit in enumerate(search_results):
+            all_qwen[i+1] = hit.vector["qwen_layout"]
+        all_qwen = all_qwen / np.linalg.norm(all_qwen, axis=1, keepdims=True)
+        sim_qwen = np.dot(all_qwen, all_qwen.T)
+        divisor += 1
         
-    # Normalización L2 segura
-    all_dino = all_dino / np.linalg.norm(all_dino, axis=1, keepdims=True)
-    all_qwen = all_qwen / np.linalg.norm(all_qwen, axis=1, keepdims=True)
+    if divisor == 0:
+        return search_results
+        
+    # 3. Distancia Original (Promedio dinámico según lo que esté activo)
+    dist_matrix = 1.0 - ((sim_dino + sim_qwen) / float(divisor)) 
     
-    # 2. Calcular Distancia Original (Promedio de Cosine Distances multimodales)
-    sim_dino = np.dot(all_dino, all_dino.T)
-    sim_qwen = np.dot(all_qwen, all_qwen.T)
-    dist_matrix = 1.0 - ((sim_dino + sim_qwen) / 2.0) # Distancia original d(p, g_i)
-    
-    # 3. Encontrar vecindarios recíprocos y aplicar pesos Gaussianos
+    # 4. Encontrar vecindarios recíprocos y aplicar pesos Gaussianos
     initial_rank = np.argsort(dist_matrix, axis=1) 
     V = np.zeros((K + 1, K + 1))
     
@@ -442,68 +527,312 @@ def local_k_reciprocal_re_ranking(vec_visual, vec_layout, search_results):
         for j in forward_k_neighbors:
             backward_k_neighbors = initial_rank[j, :k1 + 1]
             if i in backward_k_neighbors:
-                # Es recíproco. Aplicar Eq. 7 del paper
                 V[i, j] = np.exp(-dist_matrix[i, j])
                 
-    # 4. Calcular Distancia de Jaccard y Distancia Final (Eq. 10 y Eq. 12)
+    # 5. Calcular Distancia de Jaccard y Distancia Final
     V_probe = V[0] 
     re_ranked_hits = []
     
     for i in range(1, K + 1):
         V_candidate = V[i]
-        
         intersection = np.sum(np.minimum(V_probe, V_candidate))
         union = np.sum(np.maximum(V_probe, V_candidate))
-        
         jaccard_dist = 1.0 if union == 0 else 1.0 - (intersection / union)
-        
-        # Eq. 12 del paper: Combinación ponderada
         final_dist = (1 - lambda_weight) * jaccard_dist + lambda_weight * dist_matrix[0, i]
-        
-        # Convertir distancia a Score (mayor es mejor) para la lógica downstream
         final_score = 1.0 - final_dist
         
-        # Actualizamos el score del candidato
         hit = search_results[i-1]
         hit.score = float(final_score)
         re_ranked_hits.append(hit)
         
-    # Ordenar por el nuevo score k-recíproco
     re_ranked_hits.sort(key=lambda x: x.score, reverse=True)
     return re_ranked_hits
 
+# def query_online_multimodal_cached(img_crop_rgb):
+#     vec_visual = get_dinov2_embedding_from_array(img_crop_rgb)
+#     context = cfg['models']['qwen']['context']['query']
+#     vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text=context)
+#     vec_query_color = get_hsv_color_embedding(img_crop_rgb, is_query=True) # 🚀 NUEVO: Embedding de color HSV
+#     # Consulta de empaque de producto minorista desde el estante de la tienda.
+#     # Query retail product packaging from store shelf.
+    
+#     top_k = cfg['pipeline']['retrieval']['top_k']
+#     search_results = qdrant.query_points(
+#         collection_name=COLLECTION_NAME,
+#         prefetch=[
+#             models.Prefetch(query=vec_visual.tolist(), using="dinov2", limit=top_k),
+#             models.Prefetch(query=vec_layout.tolist(), using="qwen_layout", limit=top_k)
+#         ],
+#         query=models.FusionQuery(fusion=models.Fusion.RRF),
+#         limit=top_k,
+#         with_vectors=True 
+#     ).points
+    
+#     # if not search_results:
+#     #     return None
+#     if not search_results:
+#         # 🚀 NUEVO: En lugar de 'return None', devolvemos un diccionario base con el embedding
+#         return {
+#             "sku": "N/A",
+#             "name": "Desconocido",
+#             "verified": False,
+#             "embedding": vec_layout.tolist() # El tensor de DINOv2 convertido a lista
+#         }
+    
+#     # 🚀 NUEVO: Bloque de Re-Ranking K-Recíproco Topológico
+#     if cfg['pipeline']['retrieval'].get('re_ranking', {}).get('enabled', False):
+#         search_results = local_k_reciprocal_re_ranking(vec_visual, vec_layout, search_results)
+        
+#     top_embedding_hit = search_results[0]
+#     query_feats = extract_local_features_from_array(img_crop_rgb)
+    
+#     best_match = None
+#     min_inliers_valid = cfg['pipeline']['verification']['min_inliers_valid']
+#     max_inliers_found = 0 
+
+#     feat_type = cfg['models']['local_features']['type'].lower()
+
+    
+#     # Lista para guardar todos los candidatos que superen la prueba geométrica
+#     valid_matches = []
+    
+#     # Verificación Fina (¡Unificada para todos los modelos!)
+#     for hit in search_results:
+#         cand_feat_path = hit.payload.get("feature_path")
+        
+#         if not cand_feat_path:
+#             continue
+            
+#         try:
+#             cand_feats = torch.load(cand_feat_path, map_location=DEVICE, weights_only=False)
+#         except Exception:
+#             continue
+
+#         with torch.inference_mode():
+#             matches01_raw = matcher({"image0": query_feats, "image1": cand_feats})
+    
+#             if feat_type == "dedode":
+#                 matches = matches01_raw["matches"][0]
+#             else:
+#                 matches01 = rbd(matches01_raw)
+#                 matches = matches01['matches'] 
+    
+#             # 1. FILTRO PREVIO: Si LightGlue no ve nada, fuera.
+#             num_matches = len(matches)
+#             if num_matches < cfg['pipeline']['verification']['min_matches_lightglue']:
+#                 continue
+        
+#             pts0 = query_feats['keypoints'][0][matches[:, 0]].cpu().numpy()
+#             pts1 = cand_feats['keypoints'][0][matches[:, 1]].cpu().numpy()
+        
+#         H, mask = cv2.findHomography(pts0, pts1, cv2.USAC_MAGSAC, cfg['pipeline']['verification']['ransac_threshold'])
+#         if mask is None:
+#             continue
+            
+#         inliers = mask.sum()
+                
+#         # --- [PUNTO 1: CONFIDENCE RATIO] ---
+#         # Calculamos qué tan "limpio" es el match
+#         conf_ratio = inliers / num_matches if num_matches > 0 else 0
+        
+#         # Definimos si este candidato es GEOMÉTRICAMENTE SÓLIDO
+#         # Regla: O tienes muchos inliers (>25) o tienes un ratio de éxito muy alto (>45%)
+#         is_geometric_valid = (inliers >= min_inliers_valid) or (inliers >= 10 and conf_ratio > 0.5)
+        
+#         if inliers > max_inliers_found:
+#             max_inliers_found = inliers
+
+#         if is_geometric_valid:
+#             match_data = hit.payload.copy()
+#             match_data["color_hsv"] = hit.vector["color_hsv"] # Rescatamos el vector de color de Qdrant y lo guardamos en nuestro diccionario
+#             match_data["inliers"] = int(inliers)  # 🔥 El cast a int() de Python es vital aquí
+#             match_data["conf_ratio"] = float(conf_ratio) # 🔥 Cast a float nativo por seguridad
+#             match_data["fusion_score"] = float(hit.score)
+#             valid_matches.append(match_data)
+                
+#     # 🧠 LÓGICA DE DESEMPATE MULTIMODAL (TIE-BREAKER)
+#     if valid_matches:
+#         # 1. Ordenamos por inliers de mayor a menor para ver quién sacó la nota más alta
+#         valid_matches.sort(key=lambda x: x["inliers"], reverse=True)
+#         top_inliers = valid_matches[0]["inliers"]
+        
+#         # 2. Definimos un "margen de empate" (ej. diferencia de 15% respecto al mejor, con un mínimo de 5 inliers)
+#         # Si el mejor tiene 100 inliers, cualquiera con 85+ está en el empate.
+#         # Si el mejor tiene 18, cualquiera con 13+ (18-5) entra al desempate.
+#         margin = max(5, int(top_inliers * 0.15))
+#         # margin = max(4, int(top_inliers * 0.10))
+        
+#         # 3. Filtramos los candidatos que están dentro de este margen de empate técnico
+#         tied_candidates = [m for m in valid_matches if m["inliers"] >= (top_inliers - margin)]
+        
+#         # # 4. De los empatados geométricamente, DINOv2 y Qwen eligen al ganador por color/texto
+#         # best_match = max(tied_candidates, key=lambda x: x["fusion_score"])
+        
+#         # 🚀 REGLA DEL COLOR: Desempate Fantasma (Sin afectar la verificación)
+#         for cand in tied_candidates:
+#             # Recuperamos el vector de Qdrant (Asegúrate de haberlo guardado antes en el dict)
+#             cand_color = np.array(cand.get("color_hsv", np.zeros(128)))
+            
+#             # 1. DEFENSA CONTRA VECTORES VACÍOS
+#             if np.sum(vec_query_color) == 0 or np.sum(cand_color) == 0:
+#                 cand["color_score"] = 0.0
+#             else:
+#                 cand["color_score"] = float(np.dot(vec_query_color, cand_color))
+            
+#             # 2. CREACIÓN DEL "SHADOW SCORE" PARA EL DESEMPATE
+#             # Partimos del score original, pero en una variable paralela
+#             cand["selection_score"] = cand["fusion_score"]
+            
+#             # Si el color coincide moderadamente bien (luces similares), le damos un bonus para ganar
+#             if cand["color_score"] >= 0.45: # 0.30 0.40
+#                 cand["selection_score"] *= 1.2
+                
+#             # Si el color es radicalmente opuesto (Gemelo Malvado evidente), lo hundimos
+#             elif cand["color_score"] < 0.25: # 0.10 0.25
+#                 cand["selection_score"] *= 0.1 # 0.5 0.1
+                
+#         # 🧠 EL TIE-BREAKER DEFINITIVO
+#         # Elegimos al ganador usando nuestra variable fantasma alterada por el color...
+#         best_match = max(tied_candidates, key=lambda x: x["selection_score"])
+   
+        
+#         # 1. Extraemos los valores clave del ganador
+#         final_inliers = best_match["inliers"]
+#         final_score = best_match["fusion_score"]
+        
+#         # 2. VETO DINÁMICO (La magia de confiar en la geometría)
+#         best_match["verified"] = False # Asumimos falso por defecto
+        
+#         if final_inliers >= 20:
+#             # GEOMETRÍA ABRUMADORA
+#             # Si RANSAC encontró más de 20 puntos alineados, es casi imposible que sea un error.
+#             # Solo vetamos si el score multimodal es catastróficamente bajo (< 0.10)
+#             if final_score >= 0.10:
+#                 best_match["verified"] = True
+                
+#         elif final_inliers >= 14:
+#             # GEOMETRÍA DUDOSA ("La Zona de Peligro")
+#             # En tus datos, aquí están los errores entre productos hermanos.
+#             # Necesitamos que DINO/Qwen estén MUY seguros para aprobarlo.
+#             if final_score >= 0.35: 
+#                 best_match["verified"] = True       
+#         else:
+#             # INLIERS BAJOS (< 14)
+#             # Nunca lo verificamos, es puro ruido estadístico.
+#             best_match["verified"] = False
+        
+#         # 🚀 NUEVO: Adjuntamos el embedding semántico profundo al ganador
+#         best_match["embedding"] = vec_layout.tolist()    
+#         return best_match
+        
+#     else:
+#         # Fallback si nadie superó los inliers mínimos (La geometría falló)
+#         # 1. Definimos un margen estrecho para el empate técnico (ej. 5% del mejor score)
+#         top_score = search_results[0].score
+#         margin = top_score * 0.05 
+        
+#         # Filtramos los hits crudos de Qdrant que están en la zona de empate
+#         fallback_candidates = [hit for hit in search_results if hit.score >= (top_score - margin)]
+        
+#         best_fallback_hit = fallback_candidates[0]
+#         best_shadow_score = -1.0
+#         final_color_score = 0.0
+        
+#         # 2. Re-ranking por color en las sombras
+#         for hit in fallback_candidates:
+#             # En search_results, los vectores están en el atributo .vector
+#             cand_color = np.array(hit.vector.get("color_hsv", np.zeros(128)))
+            
+#             if np.sum(vec_query_color) == 0 or np.sum(cand_color) == 0:
+#                 color_score = 0.0
+#             else:
+#                 color_score = float(np.dot(vec_query_color, cand_color))
+                
+#             shadow_score = hit.score
+            
+#             # Premiamos o castigamos igual que en la verificación
+#             if color_score >= 0.45: # 0.30 0.40
+#                 shadow_score *= 1.2
+#             elif color_score < 0.25: # 0.10 0.20
+#                 shadow_score *= 0.1
+                
+#             # Coronamos al nuevo ganador del fallback
+#             if shadow_score > best_shadow_score:
+#                 best_shadow_score = shadow_score
+#                 best_fallback_hit = hit
+#                 final_color_score = color_score
+
+#         # 3. Armamos el diccionario final de respuesta con el ganador del re-ranking
+#         fallback_match = best_fallback_hit.payload.copy()
+#         fallback_match["fusion_score"] = float(best_fallback_hit.score) # Mantenemos el score real intacto
+#         fallback_match["color_score"] = float(final_color_score)
+#         fallback_match["inliers"] = int(max_inliers_found)
+#         fallback_match["verified"] = False # Siempre falso porque falló la geometría
+
+#         # 🚀 NUEVO: Adjuntamos el embedding para que el worker de video pueda usarlo
+#         fallback_match["embedding"] = vec_layout.tolist()
+        
+#         return fallback_match
+    
 def query_online_multimodal_cached(img_crop_rgb):
-    vec_visual = get_dinov2_embedding_from_array(img_crop_rgb)
-    context = cfg['models']['qwen']['context']['query']
-    vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text=context)
-    vec_query_color = get_hsv_color_embedding(img_crop_rgb, is_query=True) # 🚀 NUEVO: Embedding de color HSV
-    # Consulta de empaque de producto minorista desde el estante de la tienda.
-    # Query retail product packaging from store shelf.
-    
+    # 🚀 NUEVO: Leemos el modo de búsqueda desde config
+    search_mode = cfg['pipeline']['retrieval'].get('search_mode', 'fusion').lower()
     top_k = cfg['pipeline']['retrieval']['top_k']
-    search_results = qdrant.query_points(
-        collection_name=COLLECTION_NAME,
-        prefetch=[
-            models.Prefetch(query=vec_visual.tolist(), using="dinov2", limit=top_k),
-            models.Prefetch(query=vec_layout.tolist(), using="qwen_layout", limit=top_k)
-        ],
-        query=models.FusionQuery(fusion=models.Fusion.RRF),
-        limit=top_k,
-        with_vectors=True 
-    ).points
     
-    # if not search_results:
-    #     return None
+    vec_visual = None
+    vec_layout = None
+    
+    # 🚀 EXTRACCIÓN CONDICIONAL (Ahorro de GPU)
+    if search_mode in ["fusion", "dinov2_only"]:
+        vec_visual = get_dinov2_embedding_from_array(img_crop_rgb)
+        
+    if search_mode in ["fusion", "qwen_only"]:
+        context = cfg['models']['qwen']['context']['query']
+        vec_layout = get_qwen_layout_embedding_from_array(img_crop_rgb, metadata_text=context)
+        
+    vec_query_color = get_hsv_color_embedding(img_crop_rgb, is_query=True)
+    
+    # 🚀 BÚSQUEDA QDRANT CONDICIONAL
+    if search_mode == "dinov2_only":
+        search_results = qdrant.query_points(
+            collection_name=COLLECTION_NAME,
+            query=vec_visual.tolist(),
+            using="dinov2",
+            limit=top_k,
+            with_vectors=True 
+        ).points
+    elif search_mode == "qwen_only":
+        search_results = qdrant.query_points(
+            collection_name=COLLECTION_NAME,
+            query=vec_layout.tolist(),
+            using="qwen_layout",
+            limit=top_k,
+            with_vectors=True 
+        ).points
+    else: # Modo Fusion por defecto
+        search_results = qdrant.query_points(
+            collection_name=COLLECTION_NAME,
+            prefetch=[
+                models.Prefetch(query=vec_visual.tolist(), using="dinov2", limit=top_k),
+                models.Prefetch(query=vec_layout.tolist(), using="qwen_layout", limit=top_k)
+            ],
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            limit=top_k,
+            with_vectors=True 
+        ).points
+        
+    # Elegimos qué embedding enviar de regreso al worker de video para el cortafuegos semántico
+    # Preferimos Qwen 
+    returned_embedding = vec_layout if vec_layout is not None else vec_visual
+
     if not search_results:
-        # 🚀 NUEVO: En lugar de 'return None', devolvemos un diccionario base con el embedding
         return {
             "sku": "N/A",
             "name": "Desconocido",
             "verified": False,
-            "embedding": vec_layout.tolist() # El tensor de DINOv2 convertido a lista
+            "embedding": returned_embedding.tolist() 
         }
     
-    # 🚀 NUEVO: Bloque de Re-Ranking K-Recíproco Topológico
     if cfg['pipeline']['retrieval'].get('re_ranking', {}).get('enabled', False):
         search_results = local_k_reciprocal_re_ranking(vec_visual, vec_layout, search_results)
         
@@ -515,17 +844,12 @@ def query_online_multimodal_cached(img_crop_rgb):
     max_inliers_found = 0 
 
     feat_type = cfg['models']['local_features']['type'].lower()
-
-    
-    # Lista para guardar todos los candidatos que superen la prueba geométrica
     valid_matches = []
     
-    # Verificación Fina (¡Unificada para todos los modelos!)
     for hit in search_results:
         cand_feat_path = hit.payload.get("feature_path")
         
-        if not cand_feat_path:
-            continue
+        if not cand_feat_path: continue
             
         try:
             cand_feats = torch.load(cand_feat_path, map_location=DEVICE, weights_only=False)
@@ -541,26 +865,17 @@ def query_online_multimodal_cached(img_crop_rgb):
                 matches01 = rbd(matches01_raw)
                 matches = matches01['matches'] 
     
-            # 1. FILTRO PREVIO: Si LightGlue no ve nada, fuera.
             num_matches = len(matches)
-            if num_matches < cfg['pipeline']['verification']['min_matches_lightglue']:
-                continue
+            if num_matches < cfg['pipeline']['verification']['min_matches_lightglue']: continue
         
             pts0 = query_feats['keypoints'][0][matches[:, 0]].cpu().numpy()
             pts1 = cand_feats['keypoints'][0][matches[:, 1]].cpu().numpy()
         
         H, mask = cv2.findHomography(pts0, pts1, cv2.USAC_MAGSAC, cfg['pipeline']['verification']['ransac_threshold'])
-        if mask is None:
-            continue
+        if mask is None: continue
             
         inliers = mask.sum()
-                
-        # --- [PUNTO 1: CONFIDENCE RATIO] ---
-        # Calculamos qué tan "limpio" es el match
         conf_ratio = inliers / num_matches if num_matches > 0 else 0
-        
-        # Definimos si este candidato es GEOMÉTRICAMENTE SÓLIDO
-        # Regla: O tienes muchos inliers (>25) o tienes un ratio de éxito muy alto (>45%)
         is_geometric_valid = (inliers >= min_inliers_valid) or (inliers >= 10 and conf_ratio > 0.5)
         
         if inliers > max_inliers_found:
@@ -568,103 +883,76 @@ def query_online_multimodal_cached(img_crop_rgb):
 
         if is_geometric_valid:
             match_data = hit.payload.copy()
-            match_data["color_hsv"] = hit.vector["color_hsv"] # Rescatamos el vector de color de Qdrant y lo guardamos en nuestro diccionario
-            match_data["inliers"] = int(inliers)  # 🔥 El cast a int() de Python es vital aquí
-            match_data["conf_ratio"] = float(conf_ratio) # 🔥 Cast a float nativo por seguridad
+            match_data["color_hsv"] = hit.vector["color_hsv"] 
+            match_data["inliers"] = int(inliers) 
+            match_data["conf_ratio"] = float(conf_ratio) 
             match_data["fusion_score"] = float(hit.score)
             valid_matches.append(match_data)
                 
-    # 🧠 LÓGICA DE DESEMPATE MULTIMODAL (TIE-BREAKER)
     if valid_matches:
-        # 1. Ordenamos por inliers de mayor a menor para ver quién sacó la nota más alta
         valid_matches.sort(key=lambda x: x["inliers"], reverse=True)
         top_inliers = valid_matches[0]["inliers"]
-        
-        # 2. Definimos un "margen de empate" (ej. diferencia de 15% respecto al mejor, con un mínimo de 5 inliers)
-        # Si el mejor tiene 100 inliers, cualquiera con 85+ está en el empate.
-        # Si el mejor tiene 18, cualquiera con 13+ (18-5) entra al desempate.
         margin = max(5, int(top_inliers * 0.15))
-        # margin = max(4, int(top_inliers * 0.10))
-        
-        # 3. Filtramos los candidatos que están dentro de este margen de empate técnico
         tied_candidates = [m for m in valid_matches if m["inliers"] >= (top_inliers - margin)]
         
-        # # 4. De los empatados geométricamente, DINOv2 y Qwen eligen al ganador por color/texto
-        # best_match = max(tied_candidates, key=lambda x: x["fusion_score"])
-        
-        # 🚀 REGLA DEL COLOR: Desempate Fantasma (Sin afectar la verificación)
         for cand in tied_candidates:
-            # Recuperamos el vector de Qdrant (Asegúrate de haberlo guardado antes en el dict)
             cand_color = np.array(cand.get("color_hsv", np.zeros(128)))
             
-            # 1. DEFENSA CONTRA VECTORES VACÍOS
             if np.sum(vec_query_color) == 0 or np.sum(cand_color) == 0:
                 cand["color_score"] = 0.0
             else:
                 cand["color_score"] = float(np.dot(vec_query_color, cand_color))
             
-            # 2. CREACIÓN DEL "SHADOW SCORE" PARA EL DESEMPATE
-            # Partimos del score original, pero en una variable paralela
             cand["selection_score"] = cand["fusion_score"]
             
-            # Si el color coincide moderadamente bien (luces similares), le damos un bonus para ganar
-            if cand["color_score"] >= 0.45: # 0.30 0.40
+            if cand["color_score"] >= 0.45: 
                 cand["selection_score"] *= 1.2
+            elif cand["color_score"] < 0.25: 
+                cand["selection_score"] *= 0.1 
                 
-            # Si el color es radicalmente opuesto (Gemelo Malvado evidente), lo hundimos
-            elif cand["color_score"] < 0.25: # 0.10 0.25
-                cand["selection_score"] *= 0.1 # 0.5 0.1
-                
-        # 🧠 EL TIE-BREAKER DEFINITIVO
-        # Elegimos al ganador usando nuestra variable fantasma alterada por el color...
         best_match = max(tied_candidates, key=lambda x: x["selection_score"])
    
-        
-        # 1. Extraemos los valores clave del ganador
         final_inliers = best_match["inliers"]
         final_score = best_match["fusion_score"]
         
-        # 2. VETO DINÁMICO (La magia de confiar en la geometría)
-        best_match["verified"] = False # Asumimos falso por defecto
+        # 2. VETO DINÁMICO (Ajustado para escalas de Coseno vs RRF)
+        best_match["verified"] = False 
         
+        # 🚀 NUEVO: Detectamos si la escala de score es alta (Coseno crudo de Qwen/DINO) o baja (RRF Fusion)
+               
+        if search_mode in ["dinov2_only", "qwen_only"]:
+            # Umbrales estrictos para Qwen/DINOv2 sin re-ranking
+            thresh_high_inliers = 0.80 # Elimina el FP de Inliers=25, Score=0.791
+            thresh_med_inliers = 0.85  # Elimina el FP de Inliers=15, Score=0.841
+        else:
+            # Umbrales originales para RRF Fusion
+            thresh_high_inliers = 0.10
+            thresh_med_inliers = 0.35
+
         if final_inliers >= 20:
-            # GEOMETRÍA ABRUMADORA
-            # Si RANSAC encontró más de 20 puntos alineados, es casi imposible que sea un error.
-            # Solo vetamos si el score multimodal es catastróficamente bajo (< 0.10)
-            if final_score >= 0.10:
+            if final_score >= thresh_high_inliers:
                 best_match["verified"] = True
                 
         elif final_inliers >= 14:
-            # GEOMETRÍA DUDOSA ("La Zona de Peligro")
-            # En tus datos, aquí están los errores entre productos hermanos.
-            # Necesitamos que DINO/Qwen estén MUY seguros para aprobarlo.
-            if final_score >= 0.35: 
+            if final_score >= thresh_med_inliers: 
                 best_match["verified"] = True       
         else:
-            # INLIERS BAJOS (< 14)
-            # Nunca lo verificamos, es puro ruido estadístico.
             best_match["verified"] = False
         
-        # 🚀 NUEVO: Adjuntamos el embedding semántico profundo al ganador
-        best_match["embedding"] = vec_layout.tolist()    
+        best_match["embedding"] = returned_embedding.tolist()    
         return best_match
         
     else:
-        # Fallback si nadie superó los inliers mínimos (La geometría falló)
-        # 1. Definimos un margen estrecho para el empate técnico (ej. 5% del mejor score)
         top_score = search_results[0].score
         margin = top_score * 0.05 
         
-        # Filtramos los hits crudos de Qdrant que están en la zona de empate
         fallback_candidates = [hit for hit in search_results if hit.score >= (top_score - margin)]
         
         best_fallback_hit = fallback_candidates[0]
         best_shadow_score = -1.0
         final_color_score = 0.0
         
-        # 2. Re-ranking por color en las sombras
         for hit in fallback_candidates:
-            # En search_results, los vectores están en el atributo .vector
             cand_color = np.array(hit.vector.get("color_hsv", np.zeros(128)))
             
             if np.sum(vec_query_color) == 0 or np.sum(cand_color) == 0:
@@ -674,28 +962,22 @@ def query_online_multimodal_cached(img_crop_rgb):
                 
             shadow_score = hit.score
             
-            # Premiamos o castigamos igual que en la verificación
-            if color_score >= 0.45: # 0.30 0.40
+            if color_score >= 0.45: 
                 shadow_score *= 1.2
-            elif color_score < 0.25: # 0.10 0.20
+            elif color_score < 0.25: 
                 shadow_score *= 0.1
                 
-            # Coronamos al nuevo ganador del fallback
             if shadow_score > best_shadow_score:
                 best_shadow_score = shadow_score
                 best_fallback_hit = hit
                 final_color_score = color_score
 
-        # 3. Armamos el diccionario final de respuesta con el ganador del re-ranking
         fallback_match = best_fallback_hit.payload.copy()
-        fallback_match["fusion_score"] = float(best_fallback_hit.score) # Mantenemos el score real intacto
+        fallback_match["fusion_score"] = float(best_fallback_hit.score) 
         fallback_match["color_score"] = float(final_color_score)
         fallback_match["inliers"] = int(max_inliers_found)
-        fallback_match["verified"] = False # Siempre falso porque falló la geometría
+        fallback_match["verified"] = False 
 
-        # 🚀 NUEVO: Adjuntamos el embedding para que el worker de video pueda usarlo
-        fallback_match["embedding"] = vec_layout.tolist()
+        fallback_match["embedding"] = returned_embedding.tolist()
         
-        return fallback_match
-    
-    
+        return fallback_match    

@@ -72,10 +72,6 @@ with tab_image:
             image = ImageOps.exif_transpose(image)
             img_width, img_height = image.size
             
-            tab_auto, tab_draw, tab_manual = st.tabs(["🤖 Auto-Análisis Completo", "🖌️ Dibujar BBox", "⌨️ Ingreso Manual"])
-            
-            # with tab_auto:
-                # 🚀 SOLUCIÓN: Usamos un selector en lugar de pestañas para evitar el bug del canvas
             metodo_input = st.radio(
                 "Selecciona el método de entrada:",
                 ["🤖 Auto-Análisis Completo", "🖌️ Dibujar BBox", "⌨️ Ingreso Manual"],
@@ -157,6 +153,10 @@ with tab_image:
                             w = int((obj["width"] * obj["scaleX"]) / scale_factor)
                             h = int((obj["height"] * obj["scaleY"]) / scale_factor)
                             bboxes_to_send.append([x1, y1, x1 + w, y1 + h])
+                            
+                # 🚀 CORRECCIÓN: Si no dibujó nada, enviamos la imagen entera
+                if not bboxes_to_send:
+                    bboxes_to_send = [[0, 0, img_width, img_height]]
 
             # --- SECCIÓN 3: INGRESO POR TEXTO ---
             elif metodo_input == "⌨️ Ingreso Manual":
@@ -175,15 +175,20 @@ with tab_image:
                                 if len(coords) == 4: bboxes_to_send.append(coords)
                             except Exception:
                                 st.error(f"Línea inválida: {line}")
+                                
+                # 🚀 CORRECCIÓN: Si no ingresó nada válido, enviamos la imagen entera
+                if not bboxes_to_send:
+                    bboxes_to_send = [[0, 0, img_width, img_height]]
 
     with col2:
         st.header("2. Consultas Manuales")
         st.info("Usa esta sección solo si dibujaste o ingresaste coordenadas manualmente.")
         
-        if uploaded_file is not None and bboxes_to_send:
+        # El botón ahora aparecerá siempre que haya una imagen cargada y se esté en una pestaña manual
+        if uploaded_file is not None and bboxes_to_send and metodo_input != "🤖 Auto-Análisis Completo":
             st.write(f"📦 **Recortes a procesar:** {len(bboxes_to_send)}")
             
-            if st.button("🔍 Identificar Recortes Manuales"):
+            if st.button("🔍 Identificar Recortes Manuales", type="primary"):
                 buffered = io.BytesIO()
                 image.save(buffered, format="JPEG", quality=95)
                 img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
