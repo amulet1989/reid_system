@@ -56,7 +56,7 @@ video_processor:
     max_unseen_frames: 120
     min_trajectory_frames: 40
   geometry:
-    edge_margin_pct: 0.01
+    edge_margin_pct: 0.05
     focus_band_top_pct: 0.25
     focus_band_bottom_pct: 0.75
     min_height_pct: 0.05
