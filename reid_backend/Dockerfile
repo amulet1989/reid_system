@@ -1,5 +1,5 @@
 # Usamos una imagen oficial de PyTorch con CUDA 12.1 (Compatible con la serie RTX 3000)
-FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime
 
 # Evitar prompts interactivos durante la instalación
 ENV DEBIAN_FRONTEND=noninteractive

@@ -276,7 +276,7 @@ def get_hsv_color_embedding(img_rgb, is_query=False):
             img_work = img_work[m_y:h-m_y, m_x:w-m_x]
     else:        # Para las imágenes de referencia, aplicamos un recorte más agresivo para enfocarnos en el centro del empaque
         h, w = img_work.shape[:2]
-        m_y, m_x = int(h * 0.25), int(w * 0.25)
+        m_y, m_x = int(h * 0.10), int(w * 0.10)
         
         if (h - 2*m_y) > 10 and (w - 2*m_x) > 10:
             img_work = img_work[m_y:h-m_y, m_x:w-m_x]
@@ -666,8 +666,8 @@ def query_online_multimodal_cached(img_crop_rgb):
                
         if search_mode in ["dinov2_only", "qwen_only"]:
             # Umbrales estrictos para Qwen/DINOv2 sin re-ranking
-            thresh_high_inliers = 0.80 # Elimina el FP de Inliers=25, Score=0.791
-            thresh_med_inliers = 0.85  # Elimina el FP de Inliers=15, Score=0.841
+            thresh_high_inliers = 0.81 # Elimina el FP de Inliers=25, Score=0.791
+            thresh_med_inliers = 0.86  # Elimina el FP de Inliers=15, Score=0.841
         else:
             # Umbrales originales para RRF Fusion
             thresh_high_inliers = 0.10
