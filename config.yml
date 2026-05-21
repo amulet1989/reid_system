@@ -53,8 +53,8 @@ video_processor:
   model_name: "product_gondola_yolov26m_v01.pt"
   tracker_config: "retail_tracker.yaml"
   tracking:
-    max_unseen_frames: 120
-    min_trajectory_frames: 40
+    max_unseen_frames: 180
+    min_trajectory_frames: 60
   geometry:
     edge_margin_pct: 0.05
     focus_band_top_pct: 0.25
