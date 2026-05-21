@@ -202,21 +202,73 @@ def get_qwen_layout_embedding_from_array(img_rgb, metadata_text=""):
     return (emb / emb.norm(dim=-1, keepdim=True))[0].cpu().numpy()
 
 
+# @torch.inference_mode()
+# def extract_local_features_from_array(img_rgb):
+#     img = img_rgb.copy()
+#     max_dim = cfg['models']['local_features']['max_image_size']
+
+#     # --- [NUEVO] PREPROCESAMIENTO DINÁMICO ---
+#     if cfg['models']['local_features']['preprocess'].get('use_clahe', False):
+#         # print("⚙️ Aplicando preprocesamiento CLAHE para mejorar la detección de keypoints...")
+#         # SuperPoint prefiere intensidad de textura sobre color
+#         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+#         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+#         img_enhanced = clahe.apply(gray)
+#         # Convertimos de vuelta a RGB para mantener compatibilidad con el resto del pipeline
+#         img = cv2.cvtColor(img_enhanced, cv2.COLOR_GRAY2RGB)
+#     # -----------------------------------------
+
+#     h, w = img.shape[:2]
+#     if max(h, w) > max_dim:
+#         scale = max_dim / max(h, w)
+#         img = cv2.resize(img, (int(w * scale), int(h * scale)))
+        
+#     feat_type = cfg['models']['local_features']['type'].lower()
+    
+#     if feat_type == "dedode":
+#         image_tensor = T.ToTensor()(img).unsqueeze(0).to(DEVICE)  # [0,1] → DeDoDe lo normaliza internamente
+    
+#         max_kp = cfg['models']['local_features']['max_num_keypoints']
+    
+#         # with torch.inference_mode():
+#         keypoints, scores = extractor.detect(image_tensor, n=max_kp)
+#         descriptors = extractor.describe(image_tensor, keypoints=keypoints)
+    
+#         # 1. Aseguramos batch dim (DeDoDe devuelve sin batch aunque la entrada tenga B=1)
+#         if keypoints.ndim == 2:
+#             keypoints = keypoints.unsqueeze(0)
+#             scores = scores.unsqueeze(0)
+#             descriptors = descriptors.unsqueeze(0)
+    
+#         # 2. ¡LA CLAVE! Convertimos coordenadas normalizadas [0,1] → píxeles absolutos
+#         #    (igual que ALIKED/SuperPoint, para que homografía y MAGSAC funcionen)
+#         image_size_tensor = torch.tensor([img.shape[1], img.shape[0]], device=DEVICE).view(1, 2)
+#         keypoints = keypoints * image_size_tensor.unsqueeze(1)   # broadcasting mágico
+    
+#         feats = {
+#             "keypoints": keypoints,      # ← ahora en píxeles
+#             "descriptors": descriptors,
+#             "scores": scores,
+#             "image_size": image_size_tensor
+#         }
+#     else:
+#         # 2. Librería LightGlue estándar (ALIKED, SuperPoint, DISK, SIFT)
+#         # Esta librería prefiere su propio conversor
+#         image_tensor = numpy_image_to_torch(img).to(DEVICE)
+#         feats = extractor.extract(image_tensor)
+        
+#     return feats
+
 @torch.inference_mode()
 def extract_local_features_from_array(img_rgb):
     img = img_rgb.copy()
     max_dim = cfg['models']['local_features']['max_image_size']
 
-    # --- [NUEVO] PREPROCESAMIENTO DINÁMICO ---
+    # --- PREPROCESAMIENTO DINÁMICO ---
     if cfg['models']['local_features']['preprocess'].get('use_clahe', False):
-        # print("⚙️ Aplicando preprocesamiento CLAHE para mejorar la detección de keypoints...")
-        # SuperPoint prefiere intensidad de textura sobre color
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        img_enhanced = clahe.apply(gray)
-        # Convertimos de vuelta a RGB para mantener compatibilidad con el resto del pipeline
-        img = cv2.cvtColor(img_enhanced, cv2.COLOR_GRAY2RGB)
-    # -----------------------------------------
+        img = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2RGB)
 
     h, w = img.shape[:2]
     if max(h, w) > max_dim:
@@ -225,88 +277,153 @@ def extract_local_features_from_array(img_rgb):
         
     feat_type = cfg['models']['local_features']['type'].lower()
     
+    # 1. Unificamos la creación del Tensor principal en VRAM (Compartido para el extractor y el filtro)
+    image_tensor = T.ToTensor()(img).unsqueeze(0).to(DEVICE) # Tensor [1, 3, H, W] en rango [0, 1]
+    
     if feat_type == "dedode":
-        image_tensor = T.ToTensor()(img).unsqueeze(0).to(DEVICE)  # [0,1] → DeDoDe lo normaliza internamente
-    
         max_kp = cfg['models']['local_features']['max_num_keypoints']
-    
-        # with torch.inference_mode():
         keypoints, scores = extractor.detect(image_tensor, n=max_kp)
         descriptors = extractor.describe(image_tensor, keypoints=keypoints)
-    
-        # 1. Aseguramos batch dim (DeDoDe devuelve sin batch aunque la entrada tenga B=1)
+        
         if keypoints.ndim == 2:
             keypoints = keypoints.unsqueeze(0)
             scores = scores.unsqueeze(0)
             descriptors = descriptors.unsqueeze(0)
-    
-        # 2. ¡LA CLAVE! Convertimos coordenadas normalizadas [0,1] → píxeles absolutos
-        #    (igual que ALIKED/SuperPoint, para que homografía y MAGSAC funcionen)
+            
         image_size_tensor = torch.tensor([img.shape[1], img.shape[0]], device=DEVICE).view(1, 2)
-        keypoints = keypoints * image_size_tensor.unsqueeze(1)   # broadcasting mágico
-    
+        keypoints = keypoints * image_size_tensor.unsqueeze(1) 
+        
         feats = {
-            "keypoints": keypoints,      # ← ahora en píxeles
+            "keypoints": keypoints,     
             "descriptors": descriptors,
             "scores": scores,
             "image_size": image_size_tensor
         }
     else:
-        # 2. Librería LightGlue estándar (ALIKED, SuperPoint, DISK, SIFT)
-        # Esta librería prefiere su propio conversor
-        image_tensor = numpy_image_to_torch(img).to(DEVICE)
-        feats = extractor.extract(image_tensor)
+        # Librerías estándar LightGlue (ALIKED, SuperPoint, etc.)
+        # Podemos reutilizar el tensor multiplicándolo por 255 si usan formato uint8 nativo,
+        # o dejar que numpy_image_to_torch lo maneje para asegurar compatibilidad.
+        image_tensor_lg = numpy_image_to_torch(img).to(DEVICE)
+        feats = extractor.extract(image_tensor_lg)
         
+    # --- 🚀 NUEVO: FILTRO DE BORDES 100% EN GPU (Zero-Transfer Overhead) ---
+    
+    # A. Crear la máscara booleana sumando los 3 canales RGB. 
+    # Todo lo que sume más de un umbral ínfimo (> 0.01) es producto; el resto es negro (0).
+    mask = (image_tensor.sum(dim=1, keepdim=True) > 0.01).float() # Forma: [1, 1, H, W]
+    
+    # B. Erosión Matemática en CUDA (Max Pooling Invertido)
+    # Expandimos el fondo negro usando un pooling de 7x7 y volvemos a invertir.
+    # Es idéntico al cv2.erode, pero ejecutado directamente en los núcleos CUDA.
+    kernel_size = 7
+    pad = kernel_size // 2
+    mask_eroded = 1.0 - F.max_pool2d(1.0 - mask, kernel_size=kernel_size, stride=1, padding=pad)
+    
+    # C. Mapear coordenadas (Clamp previene errores de índice fuera de rango)
+    kpts = feats['keypoints'][0] # [N, 2]
+    x_coords = kpts[:, 0].long().clamp(0, img.shape[1] - 1)
+    y_coords = kpts[:, 1].long().clamp(0, img.shape[0] - 1)
+    
+    # D. Extraer la validación de la máscara erosionada
+    keep_mask = mask_eroded[0, 0, y_coords, x_coords] > 0
+    
+    # E. Purgar tensores
+    feats['keypoints'] = feats['keypoints'][:, keep_mask, :]
+    if 'descriptors' in feats:
+        feats['descriptors'] = feats['descriptors'][:, keep_mask, :]
+    if 'scores' in feats:
+        feats['scores'] = feats['scores'][:, keep_mask]
+    if 'keypoint_scores' in feats:
+        feats['keypoint_scores'] = feats['keypoint_scores'][:, keep_mask]
+
     return feats
 
 # Embeddings de color
+# def get_hsv_color_embedding(img_rgb, is_query=False):
+#     """
+#     Calcula un Histograma HSV 3D invariante a la escala y blindado contra NaN.
+#     """
+#     img_work = img_rgb.copy()
+    
+#     # 1. Recorte Central Geométrico (Solo para queries)
+#     if is_query:
+#         h, w = img_work.shape[:2]
+#         m_y, m_x = int(h * 0.15), int(w * 0.15)
+        
+#         # Verificamos que al recortar quede una imagen de al menos 10x10 px
+#         if (h - 2*m_y) > 10 and (w - 2*m_x) > 10: 
+#             img_work = img_work[m_y:h-m_y, m_x:w-m_x]
+#     else:        # Para las imágenes de referencia, aplicamos un recorte más agresivo para enfocarnos en el centro del empaque
+#         h, w = img_work.shape[:2]
+#         m_y, m_x = int(h * 0.10), int(w * 0.10)
+        
+#         if (h - 2*m_y) > 10 and (w - 2*m_x) > 10:
+#             img_work = img_work[m_y:h-m_y, m_x:w-m_x]
+
+#     img_hsv = cv2.cvtColor(img_work, cv2.COLOR_RGB2HSV)
+    
+#     # 2. Máscara de Color Puro (Ignorar blancos, negros, grises y destellos)
+#     # H: 0-180 (Todos los colores)
+#     # S: 30-255 (Ignorar grises y el fondo blanco del catálogo)
+#     # V: 30-240 (Ignorar sombras profundas y destellos del plástico)
+#     lower_bound = np.array([0, 10, 15])
+#     upper_bound = np.array([180, 255, 250])
+#     mask = cv2.inRange(img_hsv, lower_bound, upper_bound)
+    
+#     # 3. Histograma 3D
+#     hist = cv2.calcHist(
+#         [img_hsv], 
+#         channels=[0, 1, 2], 
+#         mask=mask, 
+#         histSize=[8, 4, 4], 
+#         ranges=[0, 180, 0, 256, 0, 256]
+#     )
+    
+#     # 4. 🚀 DEFENSA CONTRA EL VACÍO (Pixel Starvation)
+#     # Si la suma del histograma es 0, no hay colores útiles. 
+#     # Devolvemos un vector neutro para evitar errores NaN en el Coseno.
+#     if hist.sum() == 0:
+#         return np.zeros(128, dtype=np.float32)
+    
+#     # 5. Normalización L2 (Invarianza de Escala)
+#     cv2.normalize(hist, hist, norm_type=cv2.NORM_L2)
+    
+#     return hist.flatten()
+
+# Embeddings de color (Optimizado para Segmentación Exacta)
 def get_hsv_color_embedding(img_rgb, is_query=False):
     """
-    Calcula un Histograma HSV 3D invariante a la escala y blindado contra NaN.
+    Calcula un Histograma HSV 3D invariante a la escala.
+    Asume que el fondo es negro puro (0,0,0) generado por segmentación.
     """
-    img_work = img_rgb.copy()
+    img_hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
     
-    # 1. Recorte Central Geométrico (Solo para queries)
-    if is_query:
-        h, w = img_work.shape[:2]
-        m_y, m_x = int(h * 0.15), int(w * 0.15)
-        
-        # Verificamos que al recortar quede una imagen de al menos 10x10 px
-        if (h - 2*m_y) > 10 and (w - 2*m_x) > 10: 
-            img_work = img_work[m_y:h-m_y, m_x:w-m_x]
-    else:        # Para las imágenes de referencia, aplicamos un recorte más agresivo para enfocarnos en el centro del empaque
-        h, w = img_work.shape[:2]
-        m_y, m_x = int(h * 0.10), int(w * 0.10)
-        
-        if (h - 2*m_y) > 10 and (w - 2*m_x) > 10:
-            img_work = img_work[m_y:h-m_y, m_x:w-m_x]
-
-    img_hsv = cv2.cvtColor(img_work, cv2.COLOR_RGB2HSV)
+    # --- MÁSCARA INTELIGENTE ---
+    # Como la segmentación ya eliminó el estante, confiamos en todos los colores del producto.
+    # El ÚNICO color que ignoramos es el negro profundo artificial del fondo.
+    # H: 0-180 (Todos los tonos)
+    # S: 0-255 (Permitimos blancos y plateados reales del producto)
+    # V: 1-255 (Ignoramos el V=0 absoluto del fondo artificial negro)
     
-    # 2. Máscara de Color Puro (Ignorar blancos, negros, grises y destellos)
-    # H: 0-180 (Todos los colores)
-    # S: 30-255 (Ignorar grises y el fondo blanco del catálogo)
-    # V: 30-240 (Ignorar sombras profundas y destellos del plástico)
-    lower_bound = np.array([0, 10, 15])
-    upper_bound = np.array([180, 255, 250])
+    lower_bound = np.array([0, 0, 1]) 
+    upper_bound = np.array([180, 255, 255])
     mask = cv2.inRange(img_hsv, lower_bound, upper_bound)
     
-    # 3. Histograma 3D
+    # --- HISTOGRAMA 3D ---
+    # Usamos más "bins" en la saturación y valor ahora que el ruido desapareció.
     hist = cv2.calcHist(
         [img_hsv], 
         channels=[0, 1, 2], 
         mask=mask, 
-        histSize=[8, 4, 4], 
+        histSize=[8, 4, 4], # 8x4x4 = 128 dimensiones
         ranges=[0, 180, 0, 256, 0, 256]
     )
     
-    # 4. 🚀 DEFENSA CONTRA EL VACÍO (Pixel Starvation)
-    # Si la suma del histograma es 0, no hay colores útiles. 
-    # Devolvemos un vector neutro para evitar errores NaN en el Coseno.
+    # --- DEFENSA CONTRA EL VACÍO ---
     if hist.sum() == 0:
         return np.zeros(128, dtype=np.float32)
     
-    # 5. Normalización L2 (Invarianza de Escala)
+    # Normalización L2 (Invarianza de Escala y Resolución)
     cv2.normalize(hist, hist, norm_type=cv2.NORM_L2)
     
     return hist.flatten()

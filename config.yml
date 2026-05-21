@@ -8,7 +8,7 @@ system:
   csv_path: "/app/data/Catalogo_PM.csv"
 
 database:
-  collection_name: "catalogo_pm_en_color_p3"
+  collection_name: "catalogo_pm_segmentado"
 
 models:
   dinov2:

@@ -115,14 +115,12 @@ def cosine_similarity(vec1, vec2):
 def detect_bboxes_task(self, image_path):
     print(f"🔍 Ejecutando Pipeline Híbrido en Imagen Estática: {image_path}")
     
-    # --- 1. DETECCIÓN YOLO Y FILTRADO ---
     img = cv2.imread(image_path)
     if img is None:
         return {"status": "FAILED", "error": "No se pudo leer la imagen"}
 
     h_img, w_img = img.shape[:2]
     
-    # Extraemos parámetros de configuración
     margin_pct = vp_cfg['geometry']['edge_margin_pct']
     margin_x = int(w_img * margin_pct)
     margin_y = int(h_img * margin_pct)
@@ -131,81 +129,98 @@ def detect_bboxes_task(self, image_path):
     min_samples = vp_cfg.get('clustering', {}).get('min_samples', 2)
     deep_sim_threshold = vp_cfg.get('clustering', {}).get('deep_similarity_threshold', 0.50)
 
-    # Inferencia
     results = yolo_model(img, verbose=False, imgsz=imgsz, conf=confidence_threshold, iou=iou_threshold, device='cuda')
-    valid_bboxes = []
     
-    if results[0].boxes is not None:
+    active_in_frame = []
+    
+    if results[0].boxes is not None and results[0].masks is not None:
         boxes_data = results[0].boxes.xyxy.cpu().numpy().astype(int)
-        for box in boxes_data:
+        masks_xy = results[0].masks.xy # Lista de polígonos
+        
+        self.update_state(state='PROCESSING', meta={'message': f'Extrayendo {len(boxes_data)} máscaras individuales...'})
+        
+        for box, mask_pts in zip(boxes_data, masks_xy):
             x1, y1, x2, y2 = box
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w_img, x2), min(h_img, y2)
             
             is_near_edge = (x1 <= margin_x) or (y1 <= margin_y) or (x2 >= w_img - margin_x) or (y2 >= h_img - margin_y)
             if is_near_edge:
                 continue
                 
             if (x2 - x1) >= 30 and (y2 - y1) >= 30:
-                valid_bboxes.append([int(x1), int(y1), int(x2), int(y2)])
                 
-    if not valid_bboxes:
+                # 🚀 SOLUCIÓN: MÁSCARA INDIVIDUAL (Instancia Aislada)
+                if len(mask_pts) > 0:
+                    obj_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+                    pts = np.array(mask_pts, np.int32)
+                    cv2.fillPoly(obj_mask, [pts], 255)
+                    
+                    masked_img = cv2.bitwise_and(img, img, mask=obj_mask)
+                    crop = masked_img[y1:y2, x1:x2]
+                else:
+                    crop = img[y1:y2, x1:x2] # Fallback
+                
+                # Convertimos el recorte puro a Base64
+                crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(crop_rgb)
+                buffered = io.BytesIO()
+                pil_img.save(buffered, format="JPEG", quality=95)
+                img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                
+                # Enviamos este recorte como una imagen única a la API
+                payload = {"image_b64": img_b64, "bboxes": [[0, 0, crop.shape[1], crop.shape[0]]]}
+                try:
+                    res = requests.post(f"{API_URL}/api/v1/predict", json=payload)
+                    task_id = res.json().get('task_id')
+                    
+                    active_in_frame.append({
+                        "task_id": task_id,
+                        "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                        "item": None # Se llenará en el polling
+                    })
+                except Exception as e:
+                    print(f"Error encolando a API: {e}")
+                    
+    if not active_in_frame:
         try: os.remove(image_path)
         except: pass
         return {"status": "SUCCESS", "detections": []}
 
-    # --- 2. PRIMARY RE-ID (En un solo lote/batch) ---
-    self.update_state(state='PROCESSING', meta={'message': f'Consultando IA para {len(valid_bboxes)} productos...'})
+    # --- 2. POLLING ASÍNCRONO DE TODOS LOS RECORTES ---
+    self.update_state(state='PROCESSING', meta={'message': 'Esperando resolución de Re-ID de la API...'})
     
-    # Preparamos la imagen completa en Base64
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(img_rgb)
-    buffered = io.BytesIO()
-    pil_img.save(buffered, format="JPEG", quality=95)
-    img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    
-    # Enviamos TODOS los bboxes en una sola petición
-    payload = {"image_b64": img_b64, "bboxes": valid_bboxes}
-    api_detections = []
-    
-    try:
-        res = requests.post(f"{API_URL}/api/v1/predict", json=payload)
-        task_id = res.json().get('task_id')
-        
-        # Polling de la tarea única
+    for item_data in active_in_frame:
+        t_id = item_data["task_id"]
         while True:
-            res_poll = requests.get(f"{API_URL}/api/v1/results/{task_id}")
+            res_poll = requests.get(f"{API_URL}/api/v1/results/{t_id}")
             if res_poll.status_code == 200:
                 data = res_poll.json()
                 if data["status"] == "SUCCESS":
-                    api_detections = data["result"].get("detections", [])
+                    detections = data["result"].get("detections", [])
+                    if detections:
+                        pred = detections[0].get("prediction", {})
+                        item_data["item"] = {
+                            "sku": pred.get("sku", "Sin SKU"),
+                            "name": pred.get("name", "Desconocido"),
+                            "verified": pred.get("verified", False),
+                            "was_originally_verified": pred.get("verified", False),
+                            "embedding": pred.get("embedding", None),
+                            "tid": t_id, # Usamos el task_id como pseudo-tracker ID
+                            "best_frame": 0
+                        }
                     break
                 elif data["status"] == "FAILED":
-                    print(f"Error en backend Re-ID: {data.get('error')}")
+                    item_data["item"] = {
+                        "sku": "ERROR", "name": "Fallo API", "verified": False, 
+                        "was_originally_verified": False, "embedding": None, "tid": t_id, "best_frame": 0
+                    }
                     break
-            time.sleep(0.5)
-    except Exception as e:
-        print(f"Error comunicando con la API: {e}")
+            time.sleep(0.4)
 
-    # Estructuramos los datos para el clustering
-    active_in_frame = []
-    for det in api_detections:
-        pred = det.get("prediction", {})
-        item_data = {
-            "sku": pred.get("sku", "Sin SKU"),
-            "name": pred.get("name", "Desconocido"),
-            "verified": pred.get("verified", False),
-            "embedding": pred.get("embedding", None)
-        }
-        item_data["was_originally_verified"] = item_data["verified"]
-        
-        active_in_frame.append({
-            "bbox": det["bbox_coords"],
-            "item": item_data
-        })
-
-    # --- 3. MOTOR HÍBRIDO (DBSCAN + DINOv2) ---
+    # --- 3. MOTOR HÍBRIDO (DBSCAN + Semántica) ---
     n_items = len(active_in_frame)
     if n_items >= 2:
-        # Matriz de distancias de borde a borde
         dist_matrix = np.zeros((n_items, n_items))
         for i in range(n_items):
             for j in range(i+1, n_items):
@@ -213,11 +228,9 @@ def detect_bboxes_task(self, image_path):
                 dist_matrix[i, j] = dist
                 dist_matrix[j, i] = dist
         
-        # Agrupamiento Físico
         clusterer = DBSCAN(eps=dbscan_eps, min_samples=min_samples, metric='precomputed')
         labels = clusterer.fit_predict(dist_matrix)
         
-        # Resolución Semántica
         for cluster_id in set(labels):
             if cluster_id == -1: continue
             
@@ -229,7 +242,6 @@ def detect_bboxes_task(self, image_path):
                     item_dict = member["item"]
                     
                     if not item_dict["verified"]:
-                        # Ordenamos anclas por proximidad física
                         sorted_anchors = sorted(anchors, key=lambda a: (
                             bbox_distance(member["bbox"], a["bbox"]),
                             math.hypot( (member["bbox"][0]+member["bbox"][2])/2 - (a["bbox"][0]+a["bbox"][2])/2, 
@@ -242,7 +254,6 @@ def detect_bboxes_task(self, image_path):
                             emb_ancla = a["item"].get("embedding")
                             sim_score = cosine_similarity(emb_dudoso, emb_ancla)
                             
-                            # Cortafuegos Semántico
                             if sim_score >= deep_sim_threshold:
                                 item_dict["verified"] = True
                                 item_dict["sku"] = a["item"]["sku"]
@@ -252,14 +263,14 @@ def detect_bboxes_task(self, image_path):
     # --- 4. EMPAQUETADO FINAL ---
     final_results = []
     for m in active_in_frame:
-        final_results.append({
-            "bbox": m["bbox"],
-            "sku": m["item"]["sku"],
-            "name": m["item"]["name"],
-            "verified": m["item"]["verified"]
-        })
+        if m["item"] is not None:
+            final_results.append({
+                "bbox": m["bbox"],
+                "sku": m["item"]["sku"],
+                "name": m["item"]["name"],
+                "verified": m["item"]["verified"]
+            })
 
-    # Limpieza
     try:
         if os.path.exists(image_path):
             os.remove(image_path)
@@ -310,15 +321,18 @@ def process_video_task(self, video_path):
         f_top, f_bot = int(h_frame * focus_top), int(h_frame * focus_bot)
         min_bbox_h = int(h_frame * min_h_pct)
 
-        # Nota: Asumo que las variables confidence_threshold, iou_threshold e imgsz ya las extraes de config arriba.
+        # Inferencia de Tracking (YOLO-Seg usa Mask-IoU automáticamente aquí)
         results = yolo_model.track(frame, tracker=tracker_path, persist=True, verbose=False, conf=confidence_threshold, iou=iou_threshold, imgsz=imgsz, device='cuda')
         current_ids = set()
         
-        if results[0].boxes is not None and results[0].boxes.id is not None:
+        # 🚀 NUEVO: Asegurarnos de que también haya máscaras (results[0].masks)
+        if results[0].boxes is not None and results[0].boxes.id is not None and results[0].masks is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
             track_ids = results[0].boxes.id.cpu().numpy().astype(int)
+            masks_xy = results[0].masks.xy # Polígonos de segmentación
             
-            for box, tid in zip(boxes, track_ids):
+            # 🚀 NUEVO: Iteramos también sobre mask_pts
+            for box, tid, mask_pts in zip(boxes, track_ids, masks_xy):
                 current_ids.add(tid)
                 x1, y1, x2, y2 = box
                 x1, y1 = max(0, x1), max(0, y1)
@@ -347,11 +361,27 @@ def process_video_task(self, video_path):
                     active_tracks[tid]["target"] = True
                 
                 if active_tracks[tid]["target"] and in_focus and not is_near_edge:
-                    crop = frame[y1:y2, x1:x2]
+                    # 🚀 NUEVO: Enmascarado Físico Individual
+                    if len(mask_pts) > 0:
+                        # Creamos un lienzo negro del tamaño del frame
+                        obj_mask = np.zeros((h_frame, w_frame), dtype=np.uint8)
+                        pts = np.array(mask_pts, np.int32)
+                        # Dibujamos la silueta del producto en blanco
+                        cv2.fillPoly(obj_mask, [pts], 255)
+                        # Aplicamos la máscara al frame actual
+                        masked_frame = cv2.bitwise_and(frame, frame, mask=obj_mask)
+                        
+                        # Recortamos sobre el frame ya enmascarado
+                        crop = masked_frame[y1:y2, x1:x2]
+                    else:
+                        # Fallback por si la máscara viene vacía por error de YOLO
+                        crop = frame[y1:y2, x1:x2]
+
+                    # Calculamos nitidez sobre el crop recortado
                     sharpness = calculate_sharpness(crop)
                     if sharpness > active_tracks[tid]["score"]:
                         active_tracks[tid]["score"] = sharpness
-                        active_tracks[tid]["crop"] = crop.copy()
+                        active_tracks[tid]["crop"] = crop.copy() # Guardamos la versión con fondo negro
                         active_tracks[tid]["best_frame"] = frame_idx
 
         lost_tracks = []
