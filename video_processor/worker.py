@@ -32,7 +32,6 @@ if FORCE_DOWNLOAD or (not os.path.exists(MODEL_PATH) and MODEL_URL):
     print("✅ Modelo descargado exitosamente.")
 
 # Inicializar YOLO de forma global para el worker
-
 print(f"🧠 Cargando modelo YOLO: {MODEL_PATH}")
 yolo_model = YOLO(MODEL_PATH)
 tracker_path = f"/app/{vp_cfg['tracker_config']}"
@@ -51,37 +50,28 @@ celery_app = Celery(
 
 API_URL = os.getenv("API_URL", "http://api:8000")
 
+
+# --- 3. FUNCIONES MATEMÁTICAS Y GEOMÉTRICAS ---
 def calculate_sharpness(img_crop):
     gray = cv2.cvtColor(img_crop, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 def bbox_distance(box1, box2):
-    """
-    Calcula la distancia mínima entre los bordes de dos Bounding Boxes [x1, y1, x2, y2].
-    Si se tocan o se solapan, devuelve 0.0.
-    """
     x_left = max(box1[0], box2[0])
     y_top = max(box1[1], box2[1])
     x_right = min(box1[2], box2[2])
     y_bottom = min(box1[3], box2[3])
 
     if x_right < x_left and y_bottom < y_top:
-        # No se solapan en ningún eje, Pitágoras entre las esquinas más cercanas
         return math.hypot(x_left - x_right, y_top - y_bottom)
     elif x_right < x_left:
-        # Separación puramente horizontal
         return float(x_left - x_right)
     elif y_bottom < y_top:
-        # Separación puramente vertical
         return float(y_top - y_bottom)
     else:
-        # Se solapan o se tocan
         return 0.0
     
 def interpolate_trajectory(trajectory_dict):
-    """
-    Rellena los frames faltantes de un Bounding Box mediante interpolación lineal.
-    """
     frames = sorted(trajectory_dict.keys())
     if not frames: return {}
     
@@ -102,15 +92,35 @@ def interpolate_trajectory(trajectory_dict):
         
     return full_trajectory
 
-# --- FUNCIÓN MATEMÁTICA AUXILIAR ---
 def cosine_similarity(vec1, vec2):
-    """Calcula la similitud del coseno entre dos embeddings profundos."""
     if not vec1 or not vec2: return 0.0
     v1, v2 = np.array(vec1), np.array(vec2)
     norm = np.linalg.norm(v1) * np.linalg.norm(v2)
     return float(np.dot(v1, v2) / norm) if norm != 0 else 0.0
 
+def calculate_visible_ratio(crop_bgr):
+    """Calcula el porcentaje de píxeles del crop que NO son fondo negro puro."""
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    non_black_pixels = cv2.countNonZero(gray)
+    total_pixels = crop_bgr.shape[0] * crop_bgr.shape[1]
+    return non_black_pixels / total_pixels if total_pixels > 0 else 0
 
+def is_queued_behind(box_anchor, box_doubtful):
+    """Determina si el producto dudoso está en la misma fila (hacia el fondo) que el ancla."""
+    ax1, ay1, ax2, ay2 = box_anchor
+    dx1, dy1, dx2, dy2 = box_doubtful
+    
+    overlap_x = max(0, min(ax2, dx2) - max(ax1, dx1))
+    width_d = dx2 - dx1
+    if width_d == 0: return False
+    ratio_x = overlap_x / width_d
+    
+    is_behind = dy2 < ay2 # La base del dudoso está más arriba en la imagen
+    
+    return ratio_x > 0.60 and is_behind
+
+
+# --- TAREA: IMAGEN ESTÁTICA ---
 @celery_app.task(name="tasks.detect_bboxes", bind=True)
 def detect_bboxes_task(self, image_path):
     print(f"🔍 Ejecutando Pipeline Híbrido en Imagen Estática: {image_path}")
@@ -127,7 +137,7 @@ def detect_bboxes_task(self, image_path):
     
     dbscan_eps = vp_cfg.get('clustering', {}).get('dbscan_eps', 15.0)
     min_samples = vp_cfg.get('clustering', {}).get('min_samples', 2)
-    deep_sim_threshold = vp_cfg.get('clustering', {}).get('deep_similarity_threshold', 0.50)
+    deep_sim_threshold = vp_cfg.get('clustering', {}).get('deep_similarity_threshold', 0.75)
 
     results = yolo_model(img, verbose=False, imgsz=imgsz, conf=confidence_threshold, iou=iou_threshold, device='cuda')
     
@@ -135,7 +145,7 @@ def detect_bboxes_task(self, image_path):
     
     if results[0].boxes is not None and results[0].masks is not None:
         boxes_data = results[0].boxes.xyxy.cpu().numpy().astype(int)
-        masks_xy = results[0].masks.xy # Lista de polígonos
+        masks_xy = results[0].masks.xy 
         
         self.update_state(state='PROCESSING', meta={'message': f'Extrayendo {len(boxes_data)} máscaras individuales...'})
         
@@ -145,30 +155,27 @@ def detect_bboxes_task(self, image_path):
             x2, y2 = min(w_img, x2), min(h_img, y2)
             
             is_near_edge = (x1 <= margin_x) or (y1 <= margin_y) or (x2 >= w_img - margin_x) or (y2 >= h_img - margin_y)
-            if is_near_edge:
-                continue
+            if is_near_edge: continue
                 
             if (x2 - x1) >= 30 and (y2 - y1) >= 30:
-                
-                # 🚀 SOLUCIÓN: MÁSCARA INDIVIDUAL (Instancia Aislada)
                 if len(mask_pts) > 0:
                     obj_mask = np.zeros((h_img, w_img), dtype=np.uint8)
                     pts = np.array(mask_pts, np.int32)
                     cv2.fillPoly(obj_mask, [pts], 255)
-                    
                     masked_img = cv2.bitwise_and(img, img, mask=obj_mask)
                     crop = masked_img[y1:y2, x1:x2]
                 else:
-                    crop = img[y1:y2, x1:x2] # Fallback
+                    crop = img[y1:y2, x1:x2]
                 
-                # Convertimos el recorte puro a Base64
+                # 🚀 Calculamos ratio visible al vuelo para el motor híbrido
+                vis_ratio = calculate_visible_ratio(crop)
+                
                 crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
                 pil_img = Image.fromarray(crop_rgb)
                 buffered = io.BytesIO()
                 pil_img.save(buffered, format="JPEG", quality=95)
                 img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
                 
-                # Enviamos este recorte como una imagen única a la API
                 payload = {"image_b64": img_b64, "bboxes": [[0, 0, crop.shape[1], crop.shape[0]]]}
                 try:
                     res = requests.post(f"{API_URL}/api/v1/predict", json=payload)
@@ -177,7 +184,8 @@ def detect_bboxes_task(self, image_path):
                     active_in_frame.append({
                         "task_id": task_id,
                         "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                        "item": None # Se llenará en el polling
+                        "vis_ratio": vis_ratio,
+                        "item": None 
                     })
                 except Exception as e:
                     print(f"Error encolando a API: {e}")
@@ -187,7 +195,6 @@ def detect_bboxes_task(self, image_path):
         except: pass
         return {"status": "SUCCESS", "detections": []}
 
-    # --- 2. POLLING ASÍNCRONO DE TODOS LOS RECORTES ---
     self.update_state(state='PROCESSING', meta={'message': 'Esperando resolución de Re-ID de la API...'})
     
     for item_data in active_in_frame:
@@ -206,7 +213,7 @@ def detect_bboxes_task(self, image_path):
                             "verified": pred.get("verified", False),
                             "was_originally_verified": pred.get("verified", False),
                             "embedding": pred.get("embedding", None),
-                            "tid": t_id, # Usamos el task_id como pseudo-tracker ID
+                            "tid": t_id, 
                             "best_frame": 0
                         }
                     break
@@ -218,7 +225,7 @@ def detect_bboxes_task(self, image_path):
                     break
             time.sleep(0.4)
 
-    # --- 3. MOTOR HÍBRIDO (DBSCAN + Semántica) ---
+    # --- 3. MOTOR HÍBRIDO (DBSCAN + Semántica Dinámica) ---
     n_items = len(active_in_frame)
     if n_items >= 2:
         dist_matrix = np.zeros((n_items, n_items))
@@ -249,15 +256,30 @@ def detect_bboxes_task(self, image_path):
                         ))
                         
                         emb_dudoso = item_dict.get("embedding")
+                        vis_ratio = member.get("vis_ratio", 1.0)
+                        rescued = False
                         
                         for a in sorted_anchors:
                             emb_ancla = a["item"].get("embedding")
                             sim_score = cosine_similarity(emb_dudoso, emb_ancla)
                             
-                            if sim_score >= deep_sim_threshold:
+                            # 🚀 UMBRAL DINÁMICO
+                            is_behind = is_queued_behind(a["bbox"], member["bbox"])
+                            
+                            if is_behind and vis_ratio < 0.40:
+                                dyn_thresh = 0.55
+                            elif is_behind:
+                                dyn_thresh = 0.65
+                            elif vis_ratio < 0.40:
+                                dyn_thresh = 0.70
+                            else:
+                                dyn_thresh = deep_sim_threshold
+                            
+                            if sim_score >= dyn_thresh:
                                 item_dict["verified"] = True
                                 item_dict["sku"] = a["item"]["sku"]
                                 item_dict["name"] = f"{a['item']['name']} (Contexto Híbrido)"
+                                rescued = True
                                 break
 
     # --- 4. EMPAQUETADO FINAL ---
@@ -282,7 +304,8 @@ def detect_bboxes_task(self, image_path):
         "detections": final_results
     }
 
-# --- TAREA PRINCIPAL ---
+
+# --- TAREA: VIDEO TRACKING ---
 @celery_app.task(name="tasks.process_video", bind=True)
 def process_video_task(self, video_path):
     print(f"🎬 Iniciando procesamiento de video: {video_path}")
@@ -293,7 +316,6 @@ def process_video_task(self, video_path):
     active_tracks = {}
     completed_tracks = {}
     
-    # Parámetros desde config
     max_unseen = vp_cfg['tracking']['max_unseen_frames']
     min_traj = vp_cfg['tracking']['min_trajectory_frames']
     margin_pct = vp_cfg['geometry']['edge_margin_pct']
@@ -301,13 +323,12 @@ def process_video_task(self, video_path):
     focus_bot = vp_cfg['geometry']['focus_band_bottom_pct']
     min_h_pct = vp_cfg['geometry']['min_height_pct']
     
-    # 🚀 NUEVO: Parámetros del motor híbrido desde config
     dbscan_eps = vp_cfg.get('clustering', {}).get('dbscan_eps', 15.0)
     min_samples = vp_cfg.get('clustering', {}).get('min_samples', 2)
-    deep_sim_threshold = vp_cfg.get('clustering', {}).get('deep_similarity_threshold', 0.50)
+    deep_sim_threshold = vp_cfg.get('clustering', {}).get('deep_similarity_threshold', 0.75)
 
     frame_idx = 0
-    trajectories = {} # Guardará {tid: {frame_idx: [x1, y1, x2, y2]}}
+    trajectories = {} 
 
     # --- 1. TRACKING Y MEMORIA ESPACIO-TEMPORAL ---
     while cap.isOpened():
@@ -321,17 +342,14 @@ def process_video_task(self, video_path):
         f_top, f_bot = int(h_frame * focus_top), int(h_frame * focus_bot)
         min_bbox_h = int(h_frame * min_h_pct)
 
-        # Inferencia de Tracking (YOLO-Seg usa Mask-IoU automáticamente aquí)
         results = yolo_model.track(frame, tracker=tracker_path, persist=True, verbose=False, conf=confidence_threshold, iou=iou_threshold, imgsz=imgsz, device='cuda')
         current_ids = set()
         
-        # 🚀 NUEVO: Asegurarnos de que también haya máscaras (results[0].masks)
         if results[0].boxes is not None and results[0].boxes.id is not None and results[0].masks is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
             track_ids = results[0].boxes.id.cpu().numpy().astype(int)
-            masks_xy = results[0].masks.xy # Polígonos de segmentación
+            masks_xy = results[0].masks.xy 
             
-            # 🚀 NUEVO: Iteramos también sobre mask_pts
             for box, tid, mask_pts in zip(boxes, track_ids, masks_xy):
                 current_ids.add(tid)
                 x1, y1, x2, y2 = box
@@ -361,27 +379,19 @@ def process_video_task(self, video_path):
                     active_tracks[tid]["target"] = True
                 
                 if active_tracks[tid]["target"] and in_focus and not is_near_edge:
-                    # 🚀 NUEVO: Enmascarado Físico Individual
                     if len(mask_pts) > 0:
-                        # Creamos un lienzo negro del tamaño del frame
                         obj_mask = np.zeros((h_frame, w_frame), dtype=np.uint8)
                         pts = np.array(mask_pts, np.int32)
-                        # Dibujamos la silueta del producto en blanco
                         cv2.fillPoly(obj_mask, [pts], 255)
-                        # Aplicamos la máscara al frame actual
                         masked_frame = cv2.bitwise_and(frame, frame, mask=obj_mask)
-                        
-                        # Recortamos sobre el frame ya enmascarado
                         crop = masked_frame[y1:y2, x1:x2]
                     else:
-                        # Fallback por si la máscara viene vacía por error de YOLO
                         crop = frame[y1:y2, x1:x2]
 
-                    # Calculamos nitidez sobre el crop recortado
                     sharpness = calculate_sharpness(crop)
                     if sharpness > active_tracks[tid]["score"]:
                         active_tracks[tid]["score"] = sharpness
-                        active_tracks[tid]["crop"] = crop.copy() # Guardamos la versión con fondo negro
+                        active_tracks[tid]["crop"] = crop.copy() 
                         active_tracks[tid]["best_frame"] = frame_idx
 
         lost_tracks = []
@@ -449,7 +459,7 @@ def process_video_task(self, video_path):
                             info["sku"] = pred.get("sku", "Sin SKU")
                             info["name"] = pred.get("name", "Desconocido")
                             info["verified"] = pred.get("verified", False)
-                            # 🚀 Capturamos el embedding para el worker
+                            info["was_originally_verified"] = info["verified"]
                             info["embedding"] = pred.get("embedding", None)
                             item_results.append(info)
                         break
@@ -458,7 +468,7 @@ def process_video_task(self, video_path):
                         break
                 time.sleep(0.5)
 
-        # --- 3. CLUSTER FALLBACK (Motor Híbrido: DBSCAN + Semántica) ---
+        # --- 3. CLUSTER FALLBACK (Motor Híbrido: DBSCAN + Semántica Dinámica) ---
         print("🧠 Interpolando trayectorias (BBoxes completos) para estabilizar tracks...")
         full_trajectories = {tid: interpolate_trajectory(traj) for tid, traj in trajectories.items()}
         
@@ -466,7 +476,7 @@ def process_video_task(self, video_path):
         frames_to_process = set(u_item["best_frame"] for u_item in unverified_items)
         
         if frames_to_process:
-            print(f"🔍 Evaluando {len(unverified_items)} productos dudosos usando Arquitectura Híbrida en {len(frames_to_process)} frames clave...")
+            print(f"🔍 Evaluando {len(unverified_items)} productos dudosos usando Arquitectura Híbrida...")
         
         for f_target in frames_to_process:
             active_in_frame = []
@@ -480,8 +490,7 @@ def process_video_task(self, video_path):
                     })
                     
             n_items = len(active_in_frame)
-            if n_items < 2:
-                continue 
+            if n_items < 2: continue 
                 
             dist_matrix = np.zeros((n_items, n_items))
             for i in range(n_items):
@@ -490,52 +499,58 @@ def process_video_task(self, video_path):
                     dist_matrix[i, j] = dist
                     dist_matrix[j, i] = dist
             
-            # 🚀 FASE 1: GEOMETRÍA (DBSCAN Clásico)
             clusterer = DBSCAN(eps=dbscan_eps, min_samples=min_samples, metric='precomputed')
             labels = clusterer.fit_predict(dist_matrix)
             
-            unique_clusters = set(labels)
-            for cluster_id in unique_clusters:
-                if cluster_id == -1: 
-                    continue 
+            for cluster_id in set(labels):
+                if cluster_id == -1: continue 
                     
-                cluster_members = [active_in_frame[i] for i in range(len(labels)) if labels[i] == cluster_id]
-                anchors = [m for m in cluster_members if m["item"]["verified"] and "Contexto" not in m["item"].get("name", "")]
+                cluster_members = [active_in_frame[i] for i in range(n_items) if labels[i] == cluster_id]
+                anchors = [m for m in cluster_members if m["item"]["was_originally_verified"] and "Contexto" not in m["item"].get("name", "")]
                 
-                if not anchors:
-                    continue 
-                
-                # 🚀 FASE 2: SEMÁNTICA (Cortafuegos por Embedding)
-                for member in cluster_members:
-                    item_dict = member["item"]
-                    
-                    # Aseguramos que solo resolvemos en su frame óptimo
-                    if not item_dict["verified"] and item_dict["best_frame"] == f_target:
+                if anchors:
+                    for member in cluster_members:
+                        item_dict = member["item"]
                         
-                        # Ordenamos las anclas por proximidad física estricta
-                        sorted_anchors = sorted(anchors, key=lambda a: (
-                            bbox_distance(member["bbox"], a["bbox"]),
-                            math.hypot( (member["bbox"][0]+member["bbox"][2])/2 - (a["bbox"][0]+a["bbox"][2])/2, 
-                                         (member["bbox"][1]+member["bbox"][3])/2 - (a["bbox"][1]+a["bbox"][3])/2)
-                        ))
-                        
-                        emb_dudoso = item_dict.get("embedding")
-                        rescued = False
-                        
-                        for a in sorted_anchors:
-                            emb_ancla = a["item"].get("embedding")
-                            sim_score = cosine_similarity(emb_dudoso, emb_ancla)
+                        if not item_dict["verified"] and item_dict["best_frame"] == f_target:
                             
-                            if sim_score >= deep_sim_threshold:
-                                # 🟢 APROBADO: El Cortafuegos valida la similitud visual
-                                item_dict["verified"] = True
-                                item_dict["sku"] = a["item"]["sku"]
-                                item_dict["name"] = f"{a['item']['name']} (Contexto Híbrido)"
-                                rescued = True
-                                break # Detenemos la búsqueda
-                        
-                        if not rescued:
-                            print(f"❌ Dudoso ID {item_dict['tid']} vetado semánticamente. Ningún ancla superó el {deep_sim_threshold}.")
+                            sorted_anchors = sorted(anchors, key=lambda a: (
+                                bbox_distance(member["bbox"], a["bbox"]),
+                                math.hypot( (member["bbox"][0]+member["bbox"][2])/2 - (a["bbox"][0]+a["bbox"][2])/2, 
+                                             (member["bbox"][1]+member["bbox"][3])/2 - (a["bbox"][1]+a["bbox"][3])/2)
+                            ))
+                            
+                            tid_dudoso = item_dict["tid"]
+                            emb_dudoso = item_dict.get("embedding")
+                            
+                            # Obtenemos el crop para calcular el área visible
+                            crop_dudoso = completed_tracks[tid_dudoso]["crop"]
+                            vis_ratio = calculate_visible_ratio(crop_dudoso)
+                            
+                            rescued = False
+                            
+                            for a in sorted_anchors:
+                                emb_ancla = a["item"].get("embedding")
+                                sim_score = cosine_similarity(emb_dudoso, emb_ancla)
+                                
+                                # 🚀 LÓGICA DE UMBRAL DINÁMICO ESPACIAL
+                                is_behind = is_queued_behind(a["bbox"], member["bbox"])
+                                
+                                if is_behind and vis_ratio < 0.40:
+                                    dyn_thresh = 0.55
+                                elif is_behind:
+                                    dyn_thresh = 0.65
+                                elif vis_ratio < 0.40:
+                                    dyn_thresh = 0.70
+                                else:
+                                    dyn_thresh = deep_sim_threshold
+                                
+                                if sim_score >= dyn_thresh:
+                                    item_dict["verified"] = True
+                                    item_dict["sku"] = a["item"]["sku"]
+                                    item_dict["name"] = f"{a['item']['name']} (Contexto Híbrido)"
+                                    rescued = True
+                                    break 
 
         # --- 4. AGREGACIÓN FINAL ---
         stock_count = {}
